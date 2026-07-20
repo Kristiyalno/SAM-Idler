@@ -7,7 +7,10 @@ Phase 2: Run each game one at a time until cards are confirmed dropped.
 
 Automatic detection:
 - Library + playtime: Steam Web API (requires API key + Steam ID)
-- Card drops remaining: steamcommunity.com/my/badges (requires session cookies)
+- Card drops remaining: steamcommunity.com/my/gamecards/<appid> per game
+  (requires session cookies). The aggregate badges list is only used as a
+  quick best-effort pre-fill for the import dialog and bulk refresh; the
+  per-app gamecards page is what actually decides when a game is done.
 
 Requirements:
 - SAM.Game.exe and SAM.API.dll in the same folder as this script
@@ -16,6 +19,7 @@ Requirements:
 """
 
 import json
+import os
 import re
 import subprocess
 import threading
@@ -35,6 +39,25 @@ from tkinter import messagebox, simpledialog, ttk
 DATA_FILE    = Path(__file__).parent / "idler_games.json"
 CONFIG_FILE  = Path(__file__).parent / "idler_config.json"
 SAM_GAME_EXE = Path(__file__).parent / "SAM.Game.exe"
+
+# If drop-count parsing ever fails to find a count on a page that should have
+# one (Steam changed the markup again), set SAM_IDLER_DEBUG_HTML=1 in the
+# environment before launching to save the raw page HTML here for inspection
+# instead of just guessing at the fix blind next time.
+DEBUG_HTML_DUMPS = os.environ.get("SAM_IDLER_DEBUG_HTML") == "1"
+DEBUG_DUMP_DIR   = Path(__file__).parent / "debug_html"
+
+
+def _maybe_dump_debug_html(label: str, html: str) -> None:
+    if not DEBUG_HTML_DUMPS:
+        return
+    try:
+        DEBUG_DUMP_DIR.mkdir(exist_ok=True)
+        path = DEBUG_DUMP_DIR / f"{label}_{int(time.time())}.html"
+        path.write_text(html, encoding="utf-8", errors="replace")
+    except Exception:
+        pass   # debug aid only, never let this break the actual check
+
 
 PHASE1_POLL_INTERVAL = 30   # seconds between phase 1 timer checks
 PHASE2_CARD_POLL_MIN = 5    # minutes between automatic card-drop checks
@@ -197,14 +220,14 @@ def save_games(games: list) -> None:
         json.dump(games, f, indent=2)
 
 
-def default_game(app_id: str, name: str = "", playtime_h: float = 0.0) -> dict:
+def default_game(app_id: str, name: str = "", playtime_h: float = 0.0, cards_remaining: int = -1) -> dict:
     return {
         "app_id": str(app_id).strip(),
         "name": name.strip() or f"App {app_id}",
         "playtime_hours": playtime_h,
-        "cards_remaining": -1,
+        "cards_remaining": cards_remaining,
         "phase1_done": playtime_h >= 2.0,
-        "cards_done": False,
+        "cards_done": (cards_remaining == 0),
     }
 
 
@@ -277,16 +300,138 @@ def fetch_owned_games(api_key: str, steam_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Badge page parser
+# Card drop parsing
 # ---------------------------------------------------------------------------
+#
+# The per-game "gamecards" page is the authoritative source for a single
+# app's drop count: it always exists for any card-eligible game the account
+# owns (regardless of whether that game happens to be listed on the paginated
+# aggregate badges page, which Steam only populates with a subset of games).
+# On that page Steam renders one <span class="progress_info_bold"> containing
+# either "No card drops remaining" or "N card drops remaining". This mirrors
+# the parsing approach used by di72nn/steam_idle_master (a working, real-world
+# Python Steam idler) rather than a blind text search over the whole page,
+# since scanning raw HTML for that phrase risks matching help text or other
+# chrome that happens to contain similar wording.
+
+class _ProgressInfoParser(HTMLParser):
+    """Grabs the text of the first <span class="progress_info_bold"> on the
+    page, and separately notes whether a logged-in user's avatar link is
+    present (Steam always renders <a class="user_avatar"> in the page header
+    when the request cookies are valid; its absence means the cookies were
+    rejected and we got a login/error page instead)."""
+
+    def __init__(self):
+        super().__init__()
+        self.progress_text: str | None = None
+        self.is_authorized = False
+        self._capture = False
+        self._done = False
+
+    def handle_starttag(self, tag, attrs):
+        attr = dict(attrs)
+        cls = attr.get("class", "")
+        if tag == "span" and "progress_info_bold" in cls and not self._done:
+            self._capture = True
+        if tag == "a" and "user_avatar" in cls:
+            self.is_authorized = True
+
+    def handle_endtag(self, tag):
+        if tag == "span" and self._capture:
+            self._capture = False
+            self._done = True
+
+    def handle_data(self, data):
+        if self._capture:
+            self.progress_text = (self.progress_text or "") + data
+
+
+_NO_DROPS_TEXT_RE   = re.compile(r"no card drops remaining", re.IGNORECASE)
+_DROPS_LEFT_TEXT_RE = re.compile(r"(\d+)\s+card drops?\s+remaining", re.IGNORECASE)
+
+
+def fetch_app_card_drops(session_id: str, login_secure: str, app_id: str, steam_id: str = "") -> int:
+    """
+    Returns the number of card drops remaining for a single app_id, using the
+    per-game gamecards page. Returns 0 when Steam explicitly says no drops
+    remain, a positive count when it gives one, and raises ValueError if the
+    page couldn't be read as a gamecards page at all (expired cookies, wrong
+    app_id, private profile, etc.) so the caller can tell "confirmed zero"
+    apart from "couldn't check."
+    """
+    cookies = {"sessionid": session_id, "steamLoginSecure": login_secure}
+    url = (
+        f"https://steamcommunity.com/profiles/{steam_id}/gamecards/{app_id}"
+        if steam_id else
+        f"https://steamcommunity.com/my/gamecards/{app_id}"
+    )
+    html = _http_get(url, cookies=cookies)
+
+    parser = _ProgressInfoParser()
+    parser.feed(html)
+
+    if not parser.is_authorized:
+        _maybe_dump_debug_html(f"unauthorized_gamecards_{app_id}", html)
+        raise ValueError(
+            "Steam didn't recognize the session (no logged-in user found on the page). "
+            "Your session cookies have likely expired, re-enter them in Settings."
+        )
+
+    if parser.progress_text is not None:
+        text = parser.progress_text.strip()
+        if "no card drops remaining" in text.lower():
+            return 0
+        # Steam's own format is "N card drops remaining" — the number leads.
+        first_word = text.split(" ", 1)[0].strip()
+        if first_word.isdigit():
+            return int(first_word)
+        # Got a span but couldn't parse its text — fall through to the
+        # broader scan below rather than giving up immediately.
+
+    # The targeted <span class="progress_info_bold"> parse found nothing
+    # usable — either the span wasn't there, or its text didn't match the
+    # expected shape. Steam may have changed the exact markup while keeping
+    # the same wording, so fall back to a plain text scan over the whole page
+    # before concluding the check actually failed.
+    if _NO_DROPS_TEXT_RE.search(html):
+        return 0
+    m = _DROPS_LEFT_TEXT_RE.search(html)
+    if m:
+        return int(m.group(1))
+
+    _maybe_dump_debug_html(f"gamecards_{app_id}", html)
+    raise ValueError(
+        f"Couldn't find a drop count for app {app_id} on its gamecards page. "
+        "It may not support trading cards, or Steam changed the page layout."
+        + (f" (page saved to {DEBUG_DUMP_DIR} for inspection)" if DEBUG_HTML_DUMPS else
+           " Set SAM_IDLER_DEBUG_HTML=1 before launching to save the page for inspection next time.")
+    )
+
 
 class _BadgeParser(HTMLParser):
+    """Best-effort bulk parser for the aggregate badges list, used only to
+    pre-fill counts quickly for many games at once. Not authoritative — see
+    module note above. Any app_id missing here should fall back to
+    fetch_app_card_drops rather than being assumed to have 0 drops left.
+
+    Steam renders one <a class="badge_row_overlay" href=".../gamecards/N/">
+    per game, and — when there are drops left to earn, or explicitly none
+    left — one <span class="progress_info_bold">...</span> somewhere after
+    it. Rather than hand-tracking div nesting depth to know exactly where one
+    game's block "ends" (fragile: any unexpected tag Steam adds throws off
+    manual depth counting silently), this just attributes each
+    progress_info_bold span to whichever badge_row_overlay anchor appeared
+    most recently — which is equivalent in practice since Steam always emits
+    them in that order. A game whose row has no such span at all is left out
+    of the result entirely (unknown) rather than assumed to be zero, since
+    that's not something this scrape can actually confirm."""
+
     def __init__(self):
         super().__init__()
         self.drops: dict[str, int] = {}
+        self.is_authorized = False
+        self.seen_ids_in_order: list[str] = []
         self._current_appid: str | None = None
-        self._in_badge_row = False
-        self._depth = 0         # div nesting depth since badge_row entry
         self._capture_next = False
 
     def handle_starttag(self, tag, attrs):
@@ -294,42 +439,40 @@ class _BadgeParser(HTMLParser):
         cls  = attr.get("class", "")
         href = attr.get("href", "")
 
-        if tag == "div":
-            if self._in_badge_row:
-                self._depth += 1
-            # badge_row is_link is the outer container; exclude overlay/inner subclasses
-            if ("badge_row" in cls
-                    and "badge_row_overlay" not in cls
-                    and "badge_row_inner" not in cls):
-                self._in_badge_row = True
-                self._current_appid = None
-                self._depth = 1
+        if tag == "a" and "user_avatar" in cls:
+            self.is_authorized = True
 
-        # The gamecards link is on the badge_row_overlay anchor, outside badge_title_row
         if tag == "a" and "badge_row_overlay" in cls:
-            m = re.search(r"/gamecards/(\d+)/", href)
+            m = re.search(r"/gamecards/(\d+)", href)
             if m:
-                self._current_appid = m.group(1)
+                app_id = m.group(1)
+                self._current_appid = app_id
+                self.seen_ids_in_order.append(app_id)
+                # Deliberately NOT setting a default here — see class docstring.
 
         if "progress_info_bold" in cls:
             self._capture_next = True
 
-    def handle_endtag(self, tag):
-        if tag == "div" and self._in_badge_row:
-            self._depth -= 1
-            if self._depth <= 0:
-                self._in_badge_row = False
-                self._depth = 0
-
     def handle_data(self, data):
         if self._capture_next:
             self._capture_next = False
-            m = re.search(r"(\d+)\s+card drop", data.strip(), re.IGNORECASE)
-            if m and self._current_appid:
-                self.drops[self._current_appid] = int(m.group(1))
+            text = data.strip()
+            if "no card drops remaining" in text.lower():
+                if self._current_appid:
+                    self.drops[self._current_appid] = 0
+                return
+            first_word = text.split(" ", 1)[0] if text else ""
+            if first_word.isdigit() and self._current_appid:
+                self.drops[self._current_appid] = int(first_word)
 
 
-def fetch_card_drops(session_id: str, login_secure: str, steam_id: str = "") -> dict[str, int]:
+def fetch_card_drops_bulk(session_id: str, login_secure: str, steam_id: str = "") -> dict[str, int]:
+    """
+    Best-effort scrape of the paginated badges list for many games at once.
+    Only includes app_ids Steam actually chose to list there — callers should
+    treat a missing app_id as "unknown", not "zero", and fall back to
+    fetch_app_card_drops for anything that matters (see module note above).
+    """
     cookies = {"sessionid": session_id, "steamLoginSecure": login_secure}
     base = (
         f"https://steamcommunity.com/profiles/{steam_id}/badges/?l=english"
@@ -342,9 +485,14 @@ def fetch_card_drops(session_id: str, login_secure: str, steam_id: str = "") -> 
         html = _http_get(base + f"&p={page}", cookies=cookies)
         parser = _BadgeParser()
         parser.feed(html)
-        if not parser.drops and page > 1:
-            break
+        if page == 1 and not parser.is_authorized:
+            raise ValueError(
+                "Steam didn't recognize the session on the badges page (no logged-in "
+                "user found). Your session cookies have likely expired, re-enter them in Settings."
+            )
         all_drops.update(parser.drops)
+        if not parser.seen_ids_in_order and page > 1:
+            break
         if f"p={page + 1}" not in html:
             break
         page += 1
@@ -490,13 +638,14 @@ class IdleController:
 
     def _check_drops(self, app_id: str) -> int:
         try:
-            drops = fetch_card_drops(
+            return fetch_app_card_drops(
                 self.config["session_id"],
                 self.config["login_secure"],
+                app_id,
                 self.config.get("steam_id", ""),
             )
-            return drops.get(app_id, 0)
-        except Exception:
+        except Exception as exc:
+            self._log(f"Drop check failed for {app_id}: {exc}")
             return -1
 
     # Phase 1 ---------------------------------------------------------------
@@ -819,6 +968,44 @@ def _fmt_time(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+_WORD_BOUNDARY_RE = re.compile(r"\s*\S+\s*$")   # trailing run of non-space + its leading whitespace
+_WORD_FORWARD_RE  = re.compile(r"^\s*\S+\s*")   # leading run of non-space + its trailing whitespace
+
+
+def bind_word_delete(entry: tk.Entry) -> None:
+    """
+    Add Ctrl+Backspace (delete previous word) and Ctrl+Delete (delete next
+    word) to a Tk Entry widget. Stock Tk's default Entry bindings don't
+    include this (only plain Backspace/Delete and Control-h/Control-d for
+    single characters), so every text field needs it added explicitly to get
+    the word-delete behaviour people expect from other apps.
+    """
+    def _delete_word_back(event):
+        if entry.selection_present():
+            entry.delete("sel.first", "sel.last")
+            return "break"
+        pos = entry.index("insert")
+        text_before = entry.get()[:pos]
+        m = _WORD_BOUNDARY_RE.search(text_before)
+        start = m.start() if m else 0
+        entry.delete(start, pos)
+        return "break"
+
+    def _delete_word_forward(event):
+        if entry.selection_present():
+            entry.delete("sel.first", "sel.last")
+            return "break"
+        pos = entry.index("insert")
+        text_after = entry.get()[pos:]
+        m = _WORD_FORWARD_RE.match(text_after)
+        end = pos + (m.end() if m else 0)
+        entry.delete(pos, end)
+        return "break"
+
+    entry.bind("<Control-BackSpace>", _delete_word_back)
+    entry.bind("<Control-Delete>",    _delete_word_forward)
+
+
 # ---------------------------------------------------------------------------
 # Settings dialog
 # ---------------------------------------------------------------------------
@@ -877,6 +1064,7 @@ class SettingsDialog(tk.Toplevel):
         entry.bind("<Control-A>", lambda e: (entry.select_range(0, "end"), "break"))
         # Unfocus on Escape
         entry.bind("<Escape>", lambda e: self.focus_set())
+        bind_word_delete(entry)
 
         if hideable:
             hide_var = tk.BooleanVar(value=self._cfg.get(hideable, True))
@@ -992,16 +1180,20 @@ class ImportDialog(tk.Toplevel):
         self.title("Import Games")
         self.configure(bg=BG)
         self.resizable(True, True)
-        self.geometry("760x560")
+        self.geometry("780x580")
         self.grab_set()
         self.selected: list[dict] = []
         self._games      = games
         self._existing   = existing_ids
         self._unit       = unit
-        self._rows: list[tuple] = []   # (frame, BooleanVar, game_dict)
-        # Map app_id -> BooleanVar so selections survive filter/sort changes
+        # One persistent widget row per game, built once. Filtering/sorting
+        # only shows/hides and re-orders these instead of destroying and
+        # rebuilding them, so it stays fast and never risks losing selection
+        # state to a teardown mid-edit.
+        self._row_widgets: dict[str, dict] = {}   # app_id -> {"frame":..., "var":..., "drop_lbl":...}
         self._check_state: dict[str, tk.BooleanVar] = {}
-        self._sort_key   = "default"   # "default" | "name" | "playtime"
+        self._sort_key  = "default"   # "default" | "name" | "playtime" | "drops"
+        self._sort_desc = False       # False = increasing, True = decreasing
         self._build()
         self.transient(parent)
         self.wait_window()
@@ -1017,24 +1209,36 @@ class ImportDialog(tk.Toplevel):
         ff.pack(fill="x", padx=16, pady=(8, 4))
         tk.Label(ff, text="Filter:", bg=BG, fg=FG, font=FONT).pack(side="left")
         self._filter_var = tk.StringVar()
-        self._filter_var.trace_add("write", lambda *_: self._rebuild(keep_sel=True))
-        tk.Entry(ff, textvariable=self._filter_var, bg=ENTRY_BG, fg=FG, font=FONT,
-                 relief="flat", insertbackground=FG, width=22
-                 ).pack(side="left", padx=(6, 0))
+        self._filter_after_id = None
+        self._filter_var.trace_add("write", self._on_filter_changed)
+        filter_entry = tk.Entry(ff, textvariable=self._filter_var, bg=ENTRY_BG, fg=FG, font=FONT,
+                                 relief="flat", insertbackground=FG, width=22)
+        filter_entry.pack(side="left", padx=(6, 0))
+        filter_entry.focus_set()
+        bind_word_delete(filter_entry)
+        self._filter_count_lbl = tk.Label(ff, text="", bg=BG, fg=GREY, font=SMALL)
+        self._filter_count_lbl.pack(side="left", padx=(6, 0))
 
         self._sub2h_var = tk.BooleanVar(value=False)
         tk.Checkbutton(ff, text="Only under 2h", variable=self._sub2h_var,
                        bg=BG, fg=FG, selectcolor=BTN_BG, font=FONT, activebackground=BG,
-                       command=lambda: self._rebuild(keep_sel=True)).pack(side="left", padx=(10, 0))
+                       command=self._apply_filter_sort).pack(side="left", padx=(10, 0))
 
         tk.Label(ff, text="Sort:", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(12, 4))
         self._sort_var = tk.StringVar(value="default")
-        for val, label in (("default", "App ID"), ("name", "Name"), ("playtime", "Playtime")):
+        for val, label in (("default", "App ID"), ("name", "Name"),
+                            ("playtime", "Playtime"), ("drops", "Drops")):
             tk.Radiobutton(
                 ff, text=label, variable=self._sort_var, value=val,
                 bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=SMALL,
-                command=lambda: self._rebuild(keep_sel=True),
+                command=self._apply_filter_sort,
             ).pack(side="left", padx=(0, 4))
+
+        self._sort_dir_btn = tk.Button(
+            ff, text="↑ Increasing", bg=BTN_BG, fg=FG, font=SMALL, relief="flat",
+            padx=6, pady=2, cursor="hand2", bd=0, command=self._toggle_sort_dir,
+        )
+        self._sort_dir_btn.pack(side="left", padx=(8, 0))
 
         # Scrollable list
         outer = tk.Frame(self, bg=BG)
@@ -1050,22 +1254,24 @@ class ImportDialog(tk.Toplevel):
             scrollregion=self._canvas.bbox("all")))
         self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfig(self._win_id, width=e.width))
 
-        # Mouse wheel scrolling — bind to canvas AND inner frame so the wheel
-        # works wherever the cursor is, not just over the scrollbar.
+        # Mouse wheel scrolling: bind at the toplevel level via bind_all so it
+        # fires no matter which child widget (checkbox, label, row frame) the
+        # cursor happens to be over, then unbind when this window closes so it
+        # doesn't leak onto the rest of the app. Per-widget binding (the old
+        # approach) silently misses whichever widgets the row actually
+        # contains, which is most of the row's clickable area.
         def _on_wheel(event):
-            # Windows/macOS use event.delta; Linux uses Button-4/5
-            if event.num == 4 or event.delta > 0:
+            if event.num == 4 or getattr(event, "delta", 0) > 0:
                 self._canvas.yview_scroll(-1, "units")
-            elif event.num == 5 or event.delta < 0:
+            elif event.num == 5 or getattr(event, "delta", 0) < 0:
                 self._canvas.yview_scroll(1, "units")
-        for widget in (self._canvas, self._inner):
-            widget.bind("<MouseWheel>", _on_wheel)
-            widget.bind("<Button-4>",   _on_wheel)
-            widget.bind("<Button-5>",   _on_wheel)
-        # Also bind on child rows as they're created (done in _rebuild)
-        self._wheel_handler = _on_wheel
+        self.bind_all("<MouseWheel>", _on_wheel)
+        self.bind_all("<Button-4>",   _on_wheel)
+        self.bind_all("<Button-5>",   _on_wheel)
+        self.bind("<Destroy>", self._cleanup_wheel_bindings)
 
-        self._rebuild(keep_sel=False)
+        self._build_all_rows()
+        self._apply_filter_sort()
 
         # Buttons row
         bf = tk.Frame(self, bg=BG)
@@ -1082,89 +1288,145 @@ class ImportDialog(tk.Toplevel):
         tk.Button(bf, text="Select with drops", bg=BTN_BG, fg=FG, font=FONT, relief="flat",
                   padx=8, pady=4, cursor="hand2", bd=0,
                   command=self._select_with_drops).pack(side="left")
+        tk.Label(bf, text="(applies to all games, not just visible)", bg=BG, fg=GREY, font=SMALL
+                 ).pack(side="left", padx=(8, 0))
         tk.Button(bf, text="Add Selected",      bg=ACCENT,  fg="#fff", font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0,
                   command=self._confirm).pack(side="right")
 
-    def _sorted_games(self) -> list[dict]:
-        key = self._sort_var.get()
-        if key == "name":
-            return sorted(self._games, key=lambda g: g["name"].lower())
-        if key == "playtime":
-            return sorted(self._games, key=lambda g: g["playtime_hours"], reverse=True)
-        return self._games   # "default" = original order (by app_id from API)
+    def _cleanup_wheel_bindings(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        try:
+            self.unbind_all("<MouseWheel>")
+            self.unbind_all("<Button-4>")
+            self.unbind_all("<Button-5>")
+        except tk.TclError:
+            pass
 
-    def _rebuild(self, keep_sel: bool = True):
-        for w in self._inner.winfo_children():
-            w.destroy()
-        self._rows.clear()
-        ftext  = self._filter_var.get().lower()
-        sub2h  = self._sub2h_var.get()
-        unit   = self._unit
+    def _on_filter_changed(self, *_):
+        # Debounce: typing fires this on every keystroke, but re-filtering
+        # (show/hide only, no widget rebuild) is cheap enough that a short
+        # debounce is just to avoid redundant work while typing fast.
+        if self._filter_after_id is not None:
+            self.after_cancel(self._filter_after_id)
+        self._filter_after_id = self.after(120, self._apply_filter_sort)
 
-        for i, g in enumerate(self._sorted_games()):
-            if ftext and ftext not in g["name"].lower():
-                continue
-            if sub2h and g["playtime_hours"] >= 2.0:
-                continue
+    def _toggle_sort_dir(self):
+        self._sort_desc = not self._sort_desc
+        self._sort_dir_btn.config(text="↓ Decreasing" if self._sort_desc else "↑ Increasing")
+        self._apply_filter_sort()
 
-            already = g["app_id"] in self._existing
+    def _build_all_rows(self):
+        """Create one persistent widget row per game, hidden until _apply_filter_sort places them."""
+        for g in self._games:
+            app_id  = g["app_id"]
+            already = app_id in self._existing
+            var = tk.BooleanVar(value=already)
+            self._check_state[app_id] = var
 
-            # Reuse existing BooleanVar if keep_sel=True; otherwise init to already-in-list
-            if g["app_id"] not in self._check_state:
-                self._check_state[g["app_id"]] = tk.BooleanVar(value=already)
-            elif not keep_sel:
-                self._check_state[g["app_id"]].set(already)
-            var = self._check_state[g["app_id"]]
-
-            row_bg   = ROW_ODD if i % 2 == 0 else ROW_EVEN
+            row_bg   = ROW_ODD
             fg_color = GREY if already else FG
             f = tk.Frame(self._inner, bg=row_bg)
-            f.pack(fill="x")
 
-            tk.Checkbutton(f, variable=var, bg=row_bg, fg=fg_color,
-                           selectcolor=BTN_BG, activebackground=row_bg).pack(side="left", padx=(6, 0))
+            cb = tk.Checkbutton(f, variable=var, bg=row_bg, fg=fg_color,
+                                 selectcolor=BTN_BG, activebackground=row_bg)
+            cb.pack(side="left", padx=(6, 0))
             tk.Label(f, text=g["name"], bg=row_bg, fg=fg_color,
                      font=FONT, anchor="w", width=34).pack(side="left", padx=4)
 
-            pt_display = hours_to_unit(g["playtime_hours"], unit)
-            tk.Label(f, text=f"{pt_display:.1f} {unit}",
+            pt_display = hours_to_unit(g["playtime_hours"], self._unit)
+            tk.Label(f, text=f"{pt_display:.1f} {self._unit}",
                      bg=row_bg, fg=GREY, font=FONT, width=13, anchor="e").pack(side="left")
 
             drops = g.get("cards_remaining", -1)
             drops_str = str(drops) if drops >= 0 else "?"
             drops_color = GREEN if drops == 0 else (ORANGE if drops > 0 else GREY)
-            tk.Label(f, text=f"{drops_str} drops",
-                     bg=row_bg, fg=drops_color, font=FONT, width=10, anchor="e").pack(side="left", padx=(4, 6))
+            drop_lbl = tk.Label(f, text=f"{drops_str} drops left",
+                                 bg=row_bg, fg=drops_color, font=FONT, width=13, anchor="e")
+            drop_lbl.pack(side="left", padx=(4, 6))
 
-            # Propagate wheel scrolling from row widgets too
-            for w in (f,):
-                w.bind("<MouseWheel>", self._wheel_handler)
-                w.bind("<Button-4>",   self._wheel_handler)
-                w.bind("<Button-5>",   self._wheel_handler)
+            self._row_widgets[app_id] = {
+                "frame": f, "var": var, "game": g, "row_bg_even": ROW_ODD, "row_bg_odd": ROW_EVEN,
+            }
 
-            self._rows.append((f, var, g))
+    def _sorted_games(self) -> list[dict]:
+        key = self._sort_var.get()
+        if key == "name":
+            games = sorted(self._games, key=lambda g: g["name"].lower())
+        elif key == "playtime":
+            games = sorted(self._games, key=lambda g: g["playtime_hours"])
+        elif key == "drops":
+            # Unknown (-1) isn't a real quantity to rank by, so keep it
+            # pinned to the end regardless of direction: sort known values
+            # normally, then reverse only that portion, then append unknowns.
+            known   = [g for g in self._games if g.get("cards_remaining", -1) >= 0]
+            unknown = [g for g in self._games if g.get("cards_remaining", -1) < 0]
+            known.sort(key=lambda g: g["cards_remaining"])
+            if self._sort_desc:
+                known.reverse()
+            return known + unknown
+        else:
+            games = list(self._games)   # "default" = original order (by app_id from API)
+        if self._sort_desc:
+            games.reverse()
+        return games
 
-    # Selection helpers
+    def _apply_filter_sort(self):
+        ftext = self._filter_var.get().lower().strip()
+        sub2h = self._sub2h_var.get()
+
+        # Un-pack everything first so pack order can be rebuilt cleanly.
+        for w in self._row_widgets.values():
+            w["frame"].pack_forget()
+
+        visible_count = 0
+        for g in self._sorted_games():
+            app_id = g["app_id"]
+            if ftext and ftext not in g["name"].lower() and ftext not in app_id:
+                continue
+            if sub2h and g["playtime_hours"] >= 2.0:
+                continue
+            row = self._row_widgets[app_id]
+            row_bg = row["row_bg_even"] if visible_count % 2 == 0 else row["row_bg_odd"]
+            row["frame"].configure(bg=row_bg)
+            for child in row["frame"].winfo_children():
+                try:
+                    child.configure(bg=row_bg)
+                except tk.TclError:
+                    pass
+            row["frame"].pack(fill="x")
+            visible_count += 1
+
+        total = len(self._row_widgets)
+        if ftext or sub2h:
+            self._filter_count_lbl.config(text=f"{visible_count}/{total}")
+        else:
+            self._filter_count_lbl.config(text="")
+
+    # Selection helpers — these always act on every game, not just what the
+    # current filter happens to be showing, since "select all" silently only
+    # selecting the visible subset is exactly the kind of surprise that made
+    # this menu confusing to use in the first place.
     def _select_all(self):
-        for _, v, _ in self._rows:
-            v.set(True)
+        for var in self._check_state.values():
+            var.set(True)
 
     def _select_none(self):
-        for _, v, _ in self._rows:
-            v.set(False)
+        for var in self._check_state.values():
+            var.set(False)
 
     def _invert(self):
-        for _, v, _ in self._rows:
-            v.set(not v.get())
+        for var in self._check_state.values():
+            var.set(not var.get())
 
     def _select_with_drops(self):
-        for _, v, g in self._rows:
-            if g.get("cards_remaining", -1) > 0:
-                v.set(True)
+        for row in self._row_widgets.values():
+            if row["game"].get("cards_remaining", -1) > 0:
+                row["var"].set(True)
 
     def _confirm(self):
-        self.selected = [g for _, v, g in self._rows if v.get()]
+        self.selected = [row["game"] for row in self._row_widgets.values() if row["var"].get()]
         self.destroy()
 
 
@@ -1200,6 +1462,7 @@ class _CellEditor(tk.Entry):
         self.bind("<KP_Enter>",  self._commit)
         self.bind("<Escape>",    lambda e: self.destroy())
         self.bind("<FocusOut>",  self._commit)
+        bind_word_delete(self)
 
     def _commit(self, event=None):
         val = self.get()
@@ -1336,6 +1599,8 @@ class App(tk.Tk):
         self._drag_item: str | None = None
         self._last_removed: tuple | None = None
         self._resumed_before = False
+        self._sort_col: str = "order"   # column currently sorted by
+        self._sort_desc: bool = False   # False = ascending
 
         # Playtime display unit (kept in sync with a StringVar)
         self._unit_var = tk.StringVar(value=self.config.get("playtime_unit", "minutes"))
@@ -1387,7 +1652,8 @@ class App(tk.Tk):
         self._undo_btn = self._mk_btn(tb, "Undo Remove", self._undo_remove)
         self._undo_btn.pack(side="left", padx=(0, 6))
         self._undo_btn.config(state="disabled")
-        self._mk_btn(tb, "Refresh Drops",     self._refresh_drops).pack(side="left", padx=(0, 6))
+        self._refresh_btn = self._mk_btn(tb, "Refresh Drops", self._refresh_drops)
+        self._refresh_btn.pack(side="left", padx=(0, 6))
         self._mk_btn(tb, "Settings",          self._open_settings).pack(side="right")
 
         # Playtime unit selector
@@ -1421,13 +1687,13 @@ class App(tk.Tk):
         self._tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="browse")
         self._style_tree()
 
-        self._tree.heading("order",    text="#")
-        self._tree.heading("app_id",   text="App ID")
-        self._tree.heading("name",     text="Name")
-        self._tree.heading("playtime", text="Playtime")
-        self._tree.heading("drops",    text="Drops left")
-        self._tree.heading("phase1",   text="2h done")
-        self._tree.heading("cards",    text="Cards done")
+        self._tree.heading("order",    text="#",         command=lambda: self._sort_by("order"))
+        self._tree.heading("app_id",   text="App ID",    command=lambda: self._sort_by("app_id"))
+        self._tree.heading("name",     text="Name",      command=lambda: self._sort_by("name"))
+        self._tree.heading("playtime", text="Playtime",  command=lambda: self._sort_by("playtime"))
+        self._tree.heading("drops",    text="Drops left",command=lambda: self._sort_by("drops"))
+        self._tree.heading("phase1",   text="2h done",   command=lambda: self._sort_by("phase1"))
+        self._tree.heading("cards",    text="Cards done",command=lambda: self._sort_by("cards"))
 
         self._tree.column("order",    width=38,  anchor="center", stretch=False)
         self._tree.column("app_id",   width=82,  anchor="center", stretch=False)
@@ -1447,6 +1713,7 @@ class App(tk.Tk):
         self._tree.bind("<B1-Motion>",        self._drag_motion)
         self._tree.bind("<ButtonRelease-1>",  self._drag_end)
         self._tree.bind("<Double-Button-1>",  self._on_double_click)
+        self._tree.bind("<Button-3>",         self._on_right_click)
 
         # Move buttons
         of = tk.Frame(self, bg=BG)
@@ -1565,23 +1832,85 @@ class App(tk.Tk):
             return f"{val:.3f}d"
         return str(val)
 
+    def _sort_by(self, col: str):
+        if self._sort_col == col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col = col
+            self._sort_desc = False
+        self._refresh_table()
+
+    def _sorted_games_for_display(self) -> list[tuple[int, dict]]:
+        """
+        Returns [(original_index, game), ...] sorted by the current sort column.
+        The original index is needed so the '#' column always reflects list position,
+        and so drag/reorder/move operations still reference the right slot.
+        """
+        indexed = list(enumerate(self.games))
+        col = self._sort_col
+
+        if col == "order":
+            # Default: list order. Ascending = normal, descending = reversed.
+            if self._sort_desc:
+                indexed = list(reversed(indexed))
+            return indexed
+
+        def _key(pair):
+            _, g = pair
+            if col == "app_id":
+                return int(g["app_id"]) if g["app_id"].isdigit() else 0
+            if col == "name":
+                return g["name"].lower()
+            if col == "playtime":
+                return g["playtime_hours"]
+            if col == "drops":
+                v = g["cards_remaining"]
+                # Sort unknowns (-1) to the end regardless of direction
+                return (1, v) if v >= 0 else (2, 0)
+            if col == "phase1":
+                return 0 if g["phase1_done"] else 1
+            if col == "cards":
+                return 0 if g["cards_done"] else 1
+            return 0
+
+        indexed.sort(key=_key, reverse=self._sort_desc)
+        return indexed
+
+    def _update_heading_arrows(self):
+        labels = {
+            "order":    "#",
+            "app_id":   "App ID",
+            "name":     "Name",
+            "playtime": "Playtime",
+            "drops":    "Drops left",
+            "phase1":   "2h done",
+            "cards":    "Cards done",
+        }
+        arrow = " ↓" if self._sort_desc else " ↑"
+        for col, base in labels.items():
+            text = base + arrow if col == self._sort_col else base
+            self._tree.heading(col, text=text)
+
     def _refresh_table(self):
         sel     = self._tree.selection()
         sel_iid = sel[0] if sel else None
         self._tree.delete(*self._tree.get_children())
-        for i, g in enumerate(self.games):
+
+        self._update_heading_arrows()
+
+        for display_pos, (orig_idx, g) in enumerate(self._sorted_games_for_display()):
             if g["cards_done"]:
                 tag = "done"
             elif g["phase1_done"]:
                 tag = "active"
-            elif i % 2 == 0:
+            elif display_pos % 2 == 0:
                 tag = "even"
             else:
                 tag = "odd"
             drops_str = str(g["cards_remaining"]) if g["cards_remaining"] >= 0 else "?"
-            self._tree.insert("", "end", iid=str(i),
+            self._tree.insert("", "end", iid=str(orig_idx),
                 values=(
-                    i + 1,
+                    orig_idx + 1,
                     g["app_id"],
                     g["name"],
                     self._playtime_display(g["playtime_hours"]),
@@ -1701,6 +2030,80 @@ class App(tk.Tk):
     # Drag reorder
     # -----------------------------------------------------------------------
 
+    def _on_right_click(self, event):
+        iid = self._tree.identify_row(event.y)
+        if not iid:
+            return
+        # Select the row under the cursor
+        self._tree.selection_set(iid)
+        idx = int(iid)
+        g = self.games[idx]
+
+        menu = tk.Menu(self, tearoff=0, bg=BTN_BG, fg=FG,
+                       activebackground=ACCENT, activeforeground="#fff",
+                       relief="flat", bd=0)
+
+        menu.add_command(label=f"{g['name']}", state="disabled",
+                         foreground=GREY, background=BTN_BG)
+        menu.add_separator()
+
+        # Move actions
+        menu.add_command(
+            label="Move to top",
+            state="normal" if idx > 0 else "disabled",
+            command=lambda: self._move_to(idx, 0),
+        )
+        menu.add_command(
+            label="Move up",
+            state="normal" if idx > 0 else "disabled",
+            command=self._move_up,
+        )
+        menu.add_command(
+            label="Move down",
+            state="normal" if idx < len(self.games) - 1 else "disabled",
+            command=self._move_down,
+        )
+        menu.add_command(
+            label="Move to bottom",
+            state="normal" if idx < len(self.games) - 1 else "disabled",
+            command=lambda: self._move_to(idx, len(self.games) - 1),
+        )
+        menu.add_separator()
+
+        # Toggle flags
+        menu.add_command(
+            label="Mark 2h done" if not g["phase1_done"] else "Mark 2h NOT done",
+            command=lambda: self._toggle_field(idx, "phase1_done"),
+        )
+        menu.add_command(
+            label="Mark cards done" if not g["cards_done"] else "Mark cards NOT done",
+            command=lambda: self._toggle_field(idx, "cards_done"),
+        )
+        menu.add_separator()
+
+        menu.add_command(
+            label="Remove",
+            command=self._remove_game,
+        )
+
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _move_to(self, src: int, dst: int):
+        if src == dst:
+            return
+        game = self.games.pop(src)
+        self.games.insert(dst, game)
+        save_games(self.games)
+        self._refresh_table()
+        if self._tree.exists(str(dst)):
+            self._tree.selection_set(str(dst))
+
+    def _toggle_field(self, idx: int, field: str):
+        g = self.games[idx]
+        g[field] = not g[field]
+        save_games(self.games)
+        self._refresh_table()
+
     def _drag_start(self, event):
         # Don't start a drag on a double-click
         item = self._tree.identify_row(event.y)
@@ -1819,13 +2222,30 @@ class App(tk.Tk):
             return
 
         self._append_log("Fetching library from Steam...")
+        session_id   = self.config.get("session_id", "")
+        login_secure = self.config.get("login_secure", "")
+        steam_id     = self.config.get("steam_id", "")
 
         def _fetch():
             try:
-                games = fetch_owned_games(self.config["api_key"], self.config["steam_id"])
-                self.after(0, self._show_import_dialog, games)
+                games = fetch_owned_games(self.config["api_key"], steam_id)
             except Exception as exc:
                 self.after(0, messagebox.showerror, "Error", f"Library fetch failed:\n{exc}")
+                return
+            # Best-effort: fill in drop counts from the badges list if cookies
+            # are set, so the import dialog isn't showing "?" for everything.
+            # Not authoritative (see fetch_card_drops_bulk docstring) but good
+            # enough to sort/filter by at import time; a per-game check runs
+            # anyway once a game actually starts idling.
+            if session_id and login_secure:
+                try:
+                    drops = fetch_card_drops_bulk(session_id, login_secure, steam_id)
+                    for g in games:
+                        if g["app_id"] in drops:
+                            g["cards_remaining"] = drops[g["app_id"]]
+                except Exception as exc:
+                    self.after(0, self._append_log, f"Drop counts unavailable for import: {exc}")
+            self.after(0, self._show_import_dialog, games)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -1837,7 +2257,10 @@ class App(tk.Tk):
         skipped = 0
         for g in dlg.selected:
             if g["app_id"] not in existing:
-                self.games.append(default_game(g["app_id"], g["name"], g["playtime_hours"]))
+                self.games.append(default_game(
+                    g["app_id"], g["name"], g["playtime_hours"],
+                    g.get("cards_remaining", -1),
+                ))
                 added += 1
             else:
                 skipped += 1
@@ -1932,30 +2355,52 @@ class App(tk.Tk):
             messagebox.showinfo("Cookies required",
                 "Enter your sessionid and steamLoginSecure in Settings first.")
             return
-        self._append_log("Refreshing card drop counts...")
+        self._append_log(f"Refreshing card drop counts for {len(self.games)} game(s)...")
+        self._refresh_btn.config(state="disabled")
+
+        session_id   = self.config["session_id"]
+        login_secure = self.config["login_secure"]
+        steam_id     = self.config.get("steam_id", "")
+        games_snapshot = list(self.games)   # app_ids only, read on the bg thread
 
         def _fetch():
+            confirmed: dict[str, int] = {}
             try:
-                drops = fetch_card_drops(
-                    self.config["session_id"],
-                    self.config["login_secure"],
-                    self.config.get("steam_id", ""),
-                )
-                def _apply():
-                    for g in self.games:
-                        if g["app_id"] in drops:
-                            g["cards_remaining"] = drops[g["app_id"]]
-                            g["cards_done"] = False
-                        elif g["cards_remaining"] != 0:
-                            g["cards_remaining"] = 0
-                    save_games(self.games)
-                    self._refresh_table()
-                    self._append_log(
-                        f"Drop counts refreshed. {len(drops)} game(s) have drops remaining."
-                    )
-                self.after(0, _apply)
+                confirmed.update(fetch_card_drops_bulk(session_id, login_secure, steam_id))
             except Exception as exc:
-                self.after(0, self._append_log, f"Drop refresh failed: {exc}")
+                self.after(0, self._append_log, f"Bulk drop scrape skipped: {exc}")
+
+            # Anything the bulk scrape didn't confirm gets an authoritative
+            # per-app check instead of being left as a guess or wrongly zeroed.
+            unresolved = [g for g in games_snapshot if g["app_id"] not in confirmed]
+            for i, g in enumerate(unresolved):
+                try:
+                    confirmed[g["app_id"]] = fetch_app_card_drops(
+                        session_id, login_secure, g["app_id"], steam_id
+                    )
+                except Exception as exc:
+                    self.after(0, self._append_log, f"{g['name']}: {exc}")
+                if (i + 1) % 5 == 0:
+                    self.after(0, self._append_log,
+                               f"Checked {i + 1}/{len(unresolved)} remaining game(s)...")
+
+            def _apply():
+                updated = 0
+                for g in self.games:
+                    if g["app_id"] in confirmed:
+                        g["cards_remaining"] = confirmed[g["app_id"]]
+                        g["cards_done"] = (confirmed[g["app_id"]] == 0)
+                        updated += 1
+                save_games(self.games)
+                self._refresh_table()
+                still_with_drops = sum(1 for g in self.games if g["cards_remaining"] > 0)
+                unknown = sum(1 for g in self.games if g["cards_remaining"] < 0)
+                msg = f"Drop counts refreshed for {updated}/{len(self.games)} game(s). {still_with_drops} still have drops remaining."
+                if unknown:
+                    msg += f" {unknown} still unknown, couldn't confirm."
+                self._append_log(msg)
+                self._refresh_btn.config(state="normal")
+            self.after(0, _apply)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
