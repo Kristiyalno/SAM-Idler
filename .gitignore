@@ -1,0 +1,36 @@
+# Game list (personal data)
+idler_games.json
+idler_config.json
+
+# SAM binaries (not redistributable)
+SAM.Game.exe
+SAM.API.dll
+SAM.Picker.exe
+git-log.txt
+LICENSE.txt
+SteamAchievementManager-*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Venv
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+
+other/
