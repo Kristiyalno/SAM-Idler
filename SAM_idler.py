@@ -114,6 +114,7 @@ _DEFAULT_CONFIG = {
     "playtime_unit": "minutes",
     "hide_api_key": True,
     "hide_login_secure": True,
+    "phase1_threshold_hours": 2.0,   # hours; set to 0 for infinite (never auto-stop phase 1)
 }
 
 
@@ -351,14 +352,6 @@ _DROPS_LEFT_TEXT_RE = re.compile(r"(\d+)\s+card drops?\s+remaining", re.IGNORECA
 
 
 def fetch_app_card_drops(session_id: str, login_secure: str, app_id: str, steam_id: str = "") -> int:
-    """
-    Returns the number of card drops remaining for a single app_id, using the
-    per-game gamecards page. Returns 0 when Steam explicitly says no drops
-    remain, a positive count when it gives one, and raises ValueError if the
-    page couldn't be read as a gamecards page at all (expired cookies, wrong
-    app_id, private profile, etc.) so the caller can tell "confirmed zero"
-    apart from "couldn't check."
-    """
     cookies = {"sessionid": session_id, "steamLoginSecure": login_secure}
     url = (
         f"https://steamcommunity.com/profiles/{steam_id}/gamecards/{app_id}"
@@ -367,45 +360,43 @@ def fetch_app_card_drops(session_id: str, login_secure: str, app_id: str, steam_
     )
     html = _http_get(url, cookies=cookies)
 
-    parser = _ProgressInfoParser()
-    parser.feed(html)
-
-    if not parser.is_authorized:
+    # The gamecards page does NOT include <a class="user_avatar"> — that element
+    # only appears on other Steam page types. Check the data-userinfo JSON blob
+    # instead, which Steam always embeds when the session is valid.
+    is_logged_in = '"logged_in":true' in html or '"logged_in": true' in html
+    if not is_logged_in:
         _maybe_dump_debug_html(f"unauthorized_gamecards_{app_id}", html)
         raise ValueError(
-            "Steam didn't recognize the session (no logged-in user found on the page). "
-            "Your session cookies have likely expired, re-enter them in Settings."
+            "Steam didn't recognize the session (not logged in on the gamecards page). "
+            "Your session cookies have likely expired — re-enter them in Settings."
         )
+
+    parser = _ProgressInfoParser()
+    parser.feed(html)
 
     if parser.progress_text is not None:
         text = parser.progress_text.strip()
         if "no card drops remaining" in text.lower():
             return 0
-        # Steam's own format is "N card drops remaining" — the number leads.
         first_word = text.split(" ", 1)[0].strip()
         if first_word.isdigit():
             return int(first_word)
-        # Got a span but couldn't parse its text — fall through to the
-        # broader scan below rather than giving up immediately.
 
-    # The targeted <span class="progress_info_bold"> parse found nothing
-    # usable — either the span wasn't there, or its text didn't match the
-    # expected shape. Steam may have changed the exact markup while keeping
-    # the same wording, so fall back to a plain text scan over the whole page
-    # before concluding the check actually failed.
     if _NO_DROPS_TEXT_RE.search(html):
         return 0
     m = _DROPS_LEFT_TEXT_RE.search(html)
     if m:
         return int(m.group(1))
 
-    _maybe_dump_debug_html(f"gamecards_{app_id}", html)
-    raise ValueError(
-        f"Couldn't find a drop count for app {app_id} on its gamecards page. "
-        "It may not support trading cards, or Steam changed the page layout."
-        + (f" (page saved to {DEBUG_DUMP_DIR} for inspection)" if DEBUG_HTML_DUMPS else
-           " Set SAM_IDLER_DEBUG_HTML=1 before launching to save the page for inspection next time.")
-    )
+    # Page loaded and we're logged in, but no drop count found.
+    # Normal for games without trading cards — return 0.
+    if "gamecards" not in html.lower() and "badge" not in html.lower():
+        _maybe_dump_debug_html(f"gamecards_{app_id}", html)
+        raise ValueError(
+            f"App {app_id}: gamecards page didn't look like a Steam page. "
+            "Cookies may have expired or Steam returned an error."
+        )
+    return 0
 
 
 class _BadgeParser(HTMLParser):
@@ -499,6 +490,16 @@ def fetch_card_drops_bulk(session_id: str, login_secure: str, steam_id: str = ""
     return all_drops
 
 
+def _hidden_window_kwargs() -> dict:
+    """On Windows, hide the child process window via STARTUPINFO SW_HIDE."""
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0   # SW_HIDE
+    return {"startupinfo": si, "creationflags": subprocess.CREATE_NO_WINDOW}
+
+
 # ---------------------------------------------------------------------------
 # Idle process wrapper
 # ---------------------------------------------------------------------------
@@ -520,6 +521,7 @@ class IdleProcess:
             [str(SAM_GAME_EXE), self.app_id],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **_hidden_window_kwargs(),
         )
 
     def stop(self) -> None:
@@ -586,8 +588,7 @@ class IdleController:
         self.on_status(self._status)
 
     def _log(self, msg: str):
-        ts = time.strftime("%H:%M:%S")
-        self.on_log(f"[{ts}] {msg}")
+        self.on_log(msg)
 
     def _start_idle(self, app_id: str):
         if app_id not in self._procs:
@@ -651,16 +652,26 @@ class IdleController:
     # Phase 1 ---------------------------------------------------------------
 
     def _run_phase1(self):
-        targets = [g for g in self.games if not g["phase1_done"]]
+        threshold_h = float(self.config.get("phase1_threshold_hours", 2.0))
+        infinite    = threshold_h <= 0.0
+
+        if infinite:
+            targets = list(self.games)   # all games, never stop by time
+        else:
+            targets = [g for g in self.games if not g["phase1_done"]]
+
         if not targets:
-            self._status.phase = "Phase 1 skipped (all games at 2h+)"
+            self._status.phase = "Phase 1 skipped (all games at threshold+)"
             self._emit()
-            self._log("All games already past 2h, skipping Phase 1.")
+            self._log("All games already past the threshold, skipping Phase 1.")
             return
 
-        self._status.phase = "Phase 1"
+        self._status.phase = "Phase 1" + (" (infinite)" if infinite else "")
         self._status.crash_notice = ""
-        self._log(f"Phase 1: {len(targets)} game(s) need >= 2h, running simultaneously.")
+        self._log(
+            f"Phase 1: {len(targets)} game(s), "
+            + ("running until manually stopped." if infinite else f"threshold = {threshold_h}h, running simultaneously.")
+        )
 
         for g in targets:
             if self._stop.is_set():
@@ -672,22 +683,21 @@ class IdleController:
                 self._log(f"ERROR starting {g['app_id']}: {exc}")
 
         start_times    = {g["app_id"]: time.time() for g in targets}
-        paused_secs    = {g["app_id"]: 0.0 for g in targets}   # time lost to crashes, not counted
-        crash_since    = {g["app_id"]: None for g in targets}  # time.time() when crash first seen, else None
+        paused_secs    = {g["app_id"]: 0.0 for g in targets}
+        crash_since    = {g["app_id"]: None for g in targets}
         retry_counts   = {g["app_id"]: 0 for g in targets}
-        gave_up        = set()                                  # app_ids past the quick-retry burst
-        last_giveup_retry = {}                                  # app_id -> last slow-retry timestamp
-        last_crash_check = time.time()
+        gave_up        = set()
+        last_giveup_retry = {}
+        last_crash_check  = time.time()
 
         while not self._stop.is_set():
             now = time.time()
 
-            # Liveness check, throttled so we're not calling poll() every second for nothing.
             if now - last_crash_check >= CRASH_CHECK_INTERVAL:
                 last_crash_check = now
                 for g in targets:
                     app_id = g["app_id"]
-                    if g["phase1_done"]:
+                    if g["phase1_done"] and not infinite:
                         continue
                     alive = self._is_idle_alive(app_id)
                     if not alive and crash_since[app_id] is None:
@@ -696,7 +706,6 @@ class IdleController:
                         self._emit()
                     if not alive:
                         if app_id in gave_up:
-                            # Already past the initial retry burst; keep trying, just less often.
                             if now - last_giveup_retry.get(app_id, 0) < CRASH_GIVEUP_RETRY_INTERVAL:
                                 continue
                             last_giveup_retry[app_id] = now
@@ -713,55 +722,60 @@ class IdleController:
                             last_giveup_retry[app_id] = now
                             self._status.crash_notice = (
                                 f"{g['name']} isn't starting after {CRASH_MAX_RETRIES} tries. "
-                                f"Still paused, will keep retrying every {CRASH_GIVEUP_RETRY_INTERVAL // 60} min "
-                                "in the background, time isn't counting meanwhile."
+                                f"Still paused, will keep retrying every {CRASH_GIVEUP_RETRY_INTERVAL // 60} min."
                             )
                             self._log(
-                                f"{g['name']}: giving up on quick retries after {CRASH_MAX_RETRIES} attempts. "
-                                f"Will keep trying every {CRASH_GIVEUP_RETRY_INTERVAL // 60} min. "
-                                "Not counted as failed, its 2h clock is just paused."
+                                f"{g['name']}: giving up on quick retries. "
+                                f"Will retry every {CRASH_GIVEUP_RETRY_INTERVAL // 60} min. Clock paused."
                             )
                             self._emit()
 
             still_going = []
             for g in targets:
                 app_id = g["app_id"]
-                if g["phase1_done"]:
+                if g["phase1_done"] and not infinite:
                     self._stop_idle(app_id)
                     continue
                 if app_id in gave_up or crash_since[app_id] is not None:
-                    # Currently crashed/paused: don't advance this game's clock.
                     still_going.append((g, None, None))
                     continue
                 elapsed_h = (time.time() - start_times[app_id] - paused_secs[app_id]) / 3600
-                needed_h  = max(0.0, 2.0 - g["playtime_hours"])
-                if elapsed_h >= needed_h:
-                    g["phase1_done"] = True
-                    self._stop_idle(app_id)
-                    self._log(f"{g['name']} reached 2h mark.")
-                    save_games(self.games)
-                    self.on_update()
-                else:
+
+                if not infinite:
+                    needed_h = max(0.0, threshold_h - g["playtime_hours"])
+                    if elapsed_h >= needed_h:
+                        # This game hit the threshold — stop it individually and wait for the rest
+                        g["phase1_done"] = True
+                        self._stop_idle(app_id)
+                        self._log(f"{g['name']} reached {threshold_h}h mark, stopping.")
+                        save_games(self.games)
+                        self.on_update()
+                        continue
                     still_going.append((g, elapsed_h, needed_h))
+                else:
+                    still_going.append((g, elapsed_h, None))
 
             self._status.phase1_running = [g["name"] for g, _, _ in still_going]
 
-            if not still_going:
+            if not still_going and not infinite:
                 break
 
-            timed = [(eh, nh) for _, eh, nh in still_going if eh is not None]
+            # Time remaining = the LONGEST individual wait (bottleneck game)
+            # since all games run simultaneously — sum is wrong.
+            timed = [(eh, nh) for _, eh, nh in still_going if eh is not None and nh is not None]
             if timed:
-                min_secs = min((nh - eh) * 3600 for eh, nh in timed)
-                self._status.next_check_sec = min_secs
+                max_secs = max((nh - eh) * 3600 for eh, nh in timed)
+                self._status.next_check_sec = max_secs
             else:
-                # Everything currently in flight is crashed/paused; nothing to count down.
                 self._status.next_check_sec = 0.0
+
             self._emit()
             self.on_update()
-            self._stop.wait(PHASE1_POLL_INTERVAL)
+            self._stop.wait(1)   # 1-second tick so summary bar counts down live
 
         self._status.phase1_running = []
-        self._log("Phase 1 complete.")
+        if not infinite:
+            self._log("Phase 1 complete.")
         save_games(self.games)
         self.on_update()
 
@@ -1011,7 +1025,7 @@ def bind_word_delete(entry: tk.Entry) -> None:
 # ---------------------------------------------------------------------------
 
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, parent, config: dict):
+    def __init__(self, parent, config: dict, unit_var: tk.StringVar):
         super().__init__(parent)
         self.title("Settings")
         self.configure(bg=BG)
@@ -1019,7 +1033,7 @@ class SettingsDialog(tk.Toplevel):
         self.grab_set()
         self.result: dict | None = None
         self._cfg = config.copy()
-        # Track show/hide vars keyed by field name so _save can persist them
+        self._unit_var = unit_var
         self._hide_vars: dict[str, tk.BooleanVar] = {}
         self._build()
         self.transient(parent)
@@ -1131,8 +1145,39 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG, fg=GREY, font=SMALL).grid(
             row=11, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
 
+        # Display / behaviour options
+        tk.Label(self, text="Display & behaviour",
+                 bg=BG, fg=GREY, font=SMALL).grid(
+            row=12, column=0, columnspan=2, padx=16, pady=(12, 2), sticky="w")
+
+        # Playtime unit
+        unit_row = tk.Frame(self, bg=BG)
+        unit_row.grid(row=13, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
+        tk.Label(unit_row, text="Playtime unit:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        self._unit_cb = ttk.Combobox(
+            unit_row, textvariable=self._unit_var,
+            values=UNITS, state="readonly", width=10, font=FONT,
+        )
+        self._unit_cb.pack(side="left")
+        tk.Label(unit_row, text="(affects table, input fields, and summary bar)",
+                 bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(10, 0))
+
+        # Phase 1 threshold
+        thresh_row = tk.Frame(self, bg=BG)
+        thresh_row.grid(row=14, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
+        tk.Label(thresh_row, text="Phase 1 stops each game at:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        self._thresh_var = tk.StringVar(
+            value=str(self._cfg.get("phase1_threshold_hours", 2.0))
+        )
+        thresh_entry = tk.Entry(thresh_row, textvariable=self._thresh_var, bg=ENTRY_BG, fg=FG,
+                                 font=FONT, relief="flat", insertbackground=FG, width=6)
+        thresh_entry.pack(side="left")
+        bind_word_delete(thresh_entry)
+        tk.Label(thresh_row, text="hours  (set to 0 for infinite — Phase 1 never auto-stops)",
+                 bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+
         bf = tk.Frame(self, bg=BG)
-        bf.grid(row=12, column=0, columnspan=2, pady=(10, 16), padx=16, sticky="e")
+        bf.grid(row=15, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
         tk.Button(bf, text="Save",   bg=ACCENT, fg="#fff", font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self._save
                   ).pack(side="right", padx=(6, 0))
@@ -1158,14 +1203,19 @@ class SettingsDialog(tk.Toplevel):
         messagebox.showinfo("Found it", f"Resolved to Steam ID: {resolved}")
 
     def _save(self):
+        try:
+            thresh = float(self._thresh_var.get().strip().replace(",", "."))
+        except ValueError:
+            thresh = 2.0
         self.result = {
-            "api_key":           self._api_key_var.get().strip(),
-            "steam_id":          self._steam_id_var.get().strip(),
-            "session_id":        self._session_var.get().strip(),
-            "login_secure":      self._login_var.get().strip(),
-            # Persist hide checkbox states
-            "hide_api_key":      self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
-            "hide_login_secure": self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
+            "api_key":                 self._api_key_var.get().strip(),
+            "steam_id":                self._steam_id_var.get().strip(),
+            "session_id":              self._session_var.get().strip(),
+            "login_secure":            self._login_var.get().strip(),
+            "playtime_unit":           self._unit_var.get(),
+            "phase1_threshold_hours":  thresh,
+            "hide_api_key":            self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
+            "hide_login_secure":       self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
         }
         self.destroy()
 
@@ -1564,16 +1614,26 @@ class SummaryBar(tk.Frame):
         self._games_p2    = self._stat(3, "In phase 2")
         self._games_done  = self._stat(4, "Done")
 
-    def refresh(self, games: list, unit: str = "minutes"):
+    def refresh(self, games: list, unit: str = "minutes", threshold_h: float = 2.0, phase1_remaining_sec: float | None = None):
         total_drops = sum(g["cards_remaining"] for g in games if g["cards_remaining"] > 0)
-        total_h     = sum(max(0.0, 2.0 - g["playtime_hours"]) for g in games if not g["phase1_done"])
-        total_disp  = hours_to_unit(total_h, unit)
         p1   = sum(1 for g in games if not g["phase1_done"])
         p2   = sum(1 for g in games if g["phase1_done"] and not g["cards_done"])
         done = sum(1 for g in games if g["cards_done"])
 
-        self._total_drops.config(text=str(total_drops) if total_drops else ("?" if any(g["cards_remaining"] < 0 for g in games) else "0"))
-        self._total_pt.config(text=f"{total_disp:.0f} {unit}")
+        # Phase 1 time left = LONGEST individual wait (bottleneck), not sum.
+        # Games run simultaneously so the total wait is max(), not sum().
+        if phase1_remaining_sec is not None:
+            disp_val = hours_to_unit(phase1_remaining_sec / 3600, unit)
+        else:
+            max_h = max(
+                (max(0.0, threshold_h - g["playtime_hours"]) for g in games if not g["phase1_done"]),
+                default=0.0,
+            )
+            disp_val = hours_to_unit(max_h, unit)
+
+        self._total_drops.config(text=str(total_drops) if total_drops else (
+            "?" if any(g["cards_remaining"] < 0 for g in games) else "0"))
+        self._total_pt.config(text=f"{disp_val:.0f} {unit}")
         self._games_p1.config(text=str(p1))
         self._games_p2.config(text=str(p2))
         self._games_done.config(text=str(done))
@@ -1587,8 +1647,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SAM Idler")
-        self.geometry("960x780")
-        self.minsize(740, 580)
+        self.geometry("960x900")
+        self.minsize(740, 680)
         self.configure(bg=BG)
 
         self.games, games_warning   = load_games()
@@ -1608,7 +1668,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._refresh_table()
-        self._summary.refresh(self.games, self._unit_var.get())
+        self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)))
 
         # Clicking on empty space unfocuses any active entry/cell editor
         self.bind("<Button-1>", self._maybe_unfocus)
@@ -1652,28 +1712,33 @@ class App(tk.Tk):
         self._undo_btn = self._mk_btn(tb, "Undo Remove", self._undo_remove)
         self._undo_btn.pack(side="left", padx=(0, 6))
         self._undo_btn.config(state="disabled")
+        self._mk_btn(tb, "Remove All",  self._remove_all,  danger=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb, "Full Reset",  self._full_reset,  danger=True).pack(side="left", padx=(0, 6))
         self._refresh_btn = self._mk_btn(tb, "Refresh Drops", self._refresh_drops)
         self._refresh_btn.pack(side="left", padx=(0, 6))
-        self._mk_btn(tb, "Settings",          self._open_settings).pack(side="right")
-
-        # Playtime unit selector
-        unit_frame = tk.Frame(tb, bg=BG)
-        unit_frame.pack(side="right", padx=(0, 10))
-        tk.Label(unit_frame, text="Playtime unit:", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(0, 4))
-        unit_cb = ttk.Combobox(
-            unit_frame, textvariable=self._unit_var,
-            values=UNITS, state="readonly", width=9, font=FONT,
-        )
-        unit_cb.pack(side="left")
-        # Style the combobox to match dark theme
-        style = ttk.Style()
-        style.configure("TCombobox",
-            fieldbackground=ENTRY_BG, background=BTN_BG,
-            foreground=FG, arrowcolor=FG, selectbackground=ACCENT)
+        self._mk_btn(tb, "Refresh Playtimes", self._refresh_playtimes).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb, "Settings", self._open_settings).pack(side="right")
 
         # Summary bar
         self._summary = SummaryBar(self)
         self._summary.pack(fill="x", padx=16, pady=(10, 0))
+
+        # Search bar
+        search_frame = tk.Frame(self, bg=BG)
+        search_frame.pack(fill="x", padx=16, pady=(8, 0))
+        tk.Label(search_frame, text="Search:", bg=BG, fg=GREY, font=FONT).pack(side="left")
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._refresh_table())
+        search_entry = tk.Entry(
+            search_frame, textvariable=self._search_var,
+            bg=ENTRY_BG, fg=FG, font=FONT, relief="flat",
+            insertbackground=FG, width=28,
+        )
+        search_entry.pack(side="left", padx=(6, 0))
+        bind_word_delete(search_entry)
+        self._search_count_lbl = tk.Label(search_frame, text="", bg=BG, fg=GREY, font=SMALL)
+        self._search_count_lbl.pack(side="left", padx=(6, 0))
+        self._mk_btn(search_frame, "Clear", lambda: self._search_var.set("")).pack(side="left", padx=(4, 0))
 
         # Game table
         list_frame = tk.Frame(self, bg=BG)
@@ -1684,7 +1749,7 @@ class App(tk.Tk):
                  font=SMALL, bg=BG, fg=GREY, anchor="w").pack(anchor="w", pady=(0, 4))
 
         cols = ("order", "app_id", "name", "playtime", "drops", "phase1", "cards")
-        self._tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="browse")
+        self._tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="extended")
         self._style_tree()
 
         self._tree.heading("order",    text="#",         command=lambda: self._sort_by("order"))
@@ -1748,11 +1813,20 @@ class App(tk.Tk):
         log_frame = tk.Frame(self, bg=BG)
         log_frame.pack(fill="both", padx=16, pady=(10, 14))
 
-        tk.Label(log_frame, text="Log", font=BOLD, bg=BG, fg=FG).pack(anchor="w")
+        log_hdr = tk.Frame(log_frame, bg=BG)
+        log_hdr.pack(fill="x", anchor="w")
+        tk.Label(log_hdr, text="Log", font=BOLD, bg=BG, fg=FG).pack(side="left")
+        self._mk_btn(log_hdr, "Copy Log",   self._copy_log,   ).pack(side="left", padx=(8, 0))
+        self._mk_btn(log_hdr, "Export Log", self._export_log, ).pack(side="left", padx=(4, 0))
+
         self._log_text = tk.Text(
-            log_frame, height=6, state="disabled",
+            log_frame, height=10,
             bg=ENTRY_BG, fg=FG, font=MONO, relief="flat", wrap="word", bd=0,
+            state="normal",   # keep normal so user can select/copy
         )
+        # Make it read-only to typing but still selectable
+        self._log_text.bind("<Key>", lambda e: "break" if e.keysym not in (
+            "c", "C", "a", "A") and e.state & 0x4 == 0 else None)
         log_vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self._log_text.yview)
         self._log_text.configure(yscrollcommand=log_vsb.set)
         self._log_text.pack(side="left", fill="both", expand=True)
@@ -1813,7 +1887,7 @@ class App(tk.Tk):
         self.config["playtime_unit"] = self._unit
         save_config(self.config)
         self._refresh_table()
-        self._summary.refresh(self.games, self._unit)
+        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)))
 
     # -----------------------------------------------------------------------
     # Table
@@ -1831,6 +1905,12 @@ class App(tk.Tk):
         if self._unit == "days":
             return f"{val:.3f}d"
         return str(val)
+
+    _FILTER_STRIP_RE = re.compile(r"['\-:()\u2122]")
+
+    def _filter_normalize(self, s: str) -> str:
+        """Strip punctuation that shouldn't affect matching."""
+        return self._FILTER_STRIP_RE.sub("", s).lower()
 
     def _sort_by(self, col: str):
         if self._sort_col == col:
@@ -1893,17 +1973,26 @@ class App(tk.Tk):
 
     def _refresh_table(self):
         sel     = self._tree.selection()
-        sel_iid = sel[0] if sel else None
+        sel_iids = set(sel)
         self._tree.delete(*self._tree.get_children())
 
         self._update_heading_arrows()
 
+        search_raw = self._search_var.get() if hasattr(self, "_search_var") else ""
+        search_norm = self._filter_normalize(search_raw)
+
+        shown = 0
         for display_pos, (orig_idx, g) in enumerate(self._sorted_games_for_display()):
+            if search_norm:
+                name_norm = self._filter_normalize(g["name"])
+                if search_norm not in name_norm and search_norm not in g["app_id"]:
+                    continue
+            shown += 1
             if g["cards_done"]:
                 tag = "done"
             elif g["phase1_done"]:
                 tag = "active"
-            elif display_pos % 2 == 0:
+            elif shown % 2 == 0:
                 tag = "even"
             else:
                 tag = "odd"
@@ -1919,30 +2008,45 @@ class App(tk.Tk):
                     "yes" if g["cards_done"]  else "no",
                 ),
                 tags=(tag,))
-        if sel_iid and self._tree.exists(sel_iid):
-            self._tree.selection_set(sel_iid)
-        self._summary.refresh(self.games, self._unit)
+
+        # Restore selection
+        for iid in sel_iids:
+            if self._tree.exists(iid):
+                self._tree.selection_add(iid)
+
+        # Update search count label
+        if hasattr(self, "_search_count_lbl"):
+            total = len(self.games)
+            if search_norm:
+                self._search_count_lbl.config(text=f"{shown}/{total}")
+            else:
+                self._search_count_lbl.config(text="")
+
+        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)))
 
     # -----------------------------------------------------------------------
     # Inline cell editing
     # -----------------------------------------------------------------------
 
-    # Columns that are editable and what kind of edit they need
     _EDITABLE = {
         "order":    "order",
         "app_id":   "app_id",
         "name":     "text",
         "playtime": "playtime",
+        "drops":    "drops",
         "phase1":   "toggle",
         "cards":    "toggle",
     }
+
+    def _selected_indices(self) -> list[int]:
+        return [int(iid) for iid in self._tree.selection()]
 
     def _on_double_click(self, event):
         region = self._tree.identify_region(event.x, event.y)
         if region != "cell":
             return
         iid = self._tree.identify_row(event.y)
-        col = self._tree.identify_column(event.x)  # e.g. "#3"
+        col = self._tree.identify_column(event.x)
         if not iid or not col:
             return
 
@@ -1952,29 +2056,79 @@ class App(tk.Tk):
         if not edit_type:
             return
 
-        idx = int(iid)
-        g   = self.games[idx]
+        selected = self._selected_indices()
+        # If multiple rows selected and the clicked row is one of them,
+        # apply the edit to all selected. Otherwise edit just the clicked row.
+        multi = len(selected) > 1 and int(iid) in selected
+        indices = selected if multi else [int(iid)]
 
         if edit_type == "toggle":
-            # Flip boolean
-            if col_name == "phase1":
-                g["phase1_done"] = not g["phase1_done"]
-            else:
-                g["cards_done"] = not g["cards_done"]
+            # For toggle, flip based on the clicked row's current value
+            g0 = self.games[int(iid)]
+            new_val = not g0[col_name if col_name != "phase1" else "phase1_done"]
+            field = "phase1_done" if col_name == "phase1" else "cards_done"
+            for idx in indices:
+                self.games[idx][field] = new_val
             save_games(self.games)
             self._refresh_table()
             return
 
+        if multi and edit_type in ("playtime", "drops", "text"):
+            # Ask once, apply to all selected
+            self._bulk_edit(indices, col_name, edit_type)
+            return
+
+        # Single edit via inline cell editor
+        idx = int(iid)
+        g   = self.games[idx]
         if edit_type == "order":
             current_val = str(idx + 1)
         elif edit_type == "playtime":
             current_val = f"{hours_to_unit(g['playtime_hours'], self._unit):.4g}"
         elif edit_type == "app_id":
             current_val = g["app_id"]
+        elif edit_type == "drops":
+            current_val = str(g["cards_remaining"]) if g["cards_remaining"] >= 0 else "0"
         else:
             current_val = g["name"]
 
         _CellEditor(self._tree, iid, col_name, current_val, self._commit_edit)
+
+    def _bulk_edit(self, indices: list[int], col_name: str, edit_type: str):
+        """Apply the same value to all selected rows for a given column."""
+        if edit_type == "playtime":
+            prompt = f"Set playtime ({self._unit}) for {len(indices)} game(s):"
+            raw = simpledialog.askstring("Bulk Edit", prompt, parent=self)
+            if raw is None:
+                return
+            hours = parse_playtime(raw, self._unit)
+            for idx in indices:
+                self.games[idx]["playtime_hours"] = hours
+                self.games[idx]["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 2.0))
+        elif edit_type == "drops":
+            raw = simpledialog.askstring(
+                "Bulk Edit", f"Set drops remaining for {len(indices)} game(s):", parent=self
+            )
+            if raw is None:
+                return
+            try:
+                drops = int(raw.strip())
+            except ValueError:
+                drops = -1
+            for idx in indices:
+                self.games[idx]["cards_remaining"] = drops
+                if drops == 0:
+                    self.games[idx]["cards_done"] = True
+        elif edit_type == "text":
+            raw = simpledialog.askstring(
+                "Bulk Edit", f"Set name for {len(indices)} game(s):", parent=self
+            )
+            if raw is None:
+                return
+            for idx in indices:
+                self.games[idx]["name"] = raw.strip() or self.games[idx]["name"]
+        save_games(self.games)
+        self._refresh_table()
 
     def _commit_edit(self, iid: str, col_name: str, raw_val: str):
         idx = int(iid)
@@ -2021,7 +2175,19 @@ class App(tk.Tk):
         if col_name == "playtime":
             hours = parse_playtime(raw_val, self._unit)
             g["playtime_hours"] = hours
-            g["phase1_done"]    = hours >= 2.0
+            g["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 2.0))
+            save_games(self.games)
+            self._refresh_table()
+            return
+
+        if col_name == "drops":
+            try:
+                drops = int(raw_val.strip())
+            except ValueError:
+                return
+            g["cards_remaining"] = drops
+            if drops == 0:
+                g["cards_done"] = True
             save_games(self.games)
             self._refresh_table()
             return
@@ -2034,59 +2200,95 @@ class App(tk.Tk):
         iid = self._tree.identify_row(event.y)
         if not iid:
             return
-        # Select the row under the cursor
-        self._tree.selection_set(iid)
+        # If the right-clicked row isn't in the current selection, select just it
+        if iid not in self._tree.selection():
+            self._tree.selection_set(iid)
+        selected = self._selected_indices()
         idx = int(iid)
         g = self.games[idx]
+        multi = len(selected) > 1
 
         menu = tk.Menu(self, tearoff=0, bg=BTN_BG, fg=FG,
                        activebackground=ACCENT, activeforeground="#fff",
                        relief="flat", bd=0)
 
-        menu.add_command(label=f"{g['name']}", state="disabled",
-                         foreground=GREY, background=BTN_BG)
+        header = f"{g['name']}" if not multi else f"{len(selected)} games selected"
+        menu.add_command(label=header, state="disabled", foreground=GREY, background=BTN_BG)
         menu.add_separator()
 
-        # Move actions
-        menu.add_command(
-            label="Move to top",
-            state="normal" if idx > 0 else "disabled",
-            command=lambda: self._move_to(idx, 0),
+        if not multi:
+            menu.add_command(
+                label="Move to top",
+                state="normal" if idx > 0 else "disabled",
+                command=lambda: self._move_to(idx, 0),
+            )
+            menu.add_command(
+                label="Move up",
+                state="normal" if idx > 0 else "disabled",
+                command=self._move_up,
+            )
+            menu.add_command(
+                label="Move down",
+                state="normal" if idx < len(self.games) - 1 else "disabled",
+                command=self._move_down,
+            )
+            menu.add_command(
+                label="Move to bottom",
+                state="normal" if idx < len(self.games) - 1 else "disabled",
+                command=lambda: self._move_to(idx, len(self.games) - 1),
+            )
+            menu.add_separator()
+
+        # Toggle flags (works for single and multi)
+        thresh = float(self.config.get("phase1_threshold_hours", 2.0))
+        label_2h = f"Mark {len(selected)} game(s) 2h done" if multi else (
+            "Mark 2h done" if not g["phase1_done"] else "Mark 2h NOT done"
         )
-        menu.add_command(
-            label="Move up",
-            state="normal" if idx > 0 else "disabled",
-            command=self._move_up,
+        menu.add_command(label=label_2h, command=lambda: self._set_field_all(selected, "phase1_done", True if multi else not g["phase1_done"]))
+
+        label_cards = f"Mark {len(selected)} game(s) cards done" if multi else (
+            "Mark cards done" if not g["cards_done"] else "Mark cards NOT done"
         )
-        menu.add_command(
-            label="Move down",
-            state="normal" if idx < len(self.games) - 1 else "disabled",
-            command=self._move_down,
-        )
-        menu.add_command(
-            label="Move to bottom",
-            state="normal" if idx < len(self.games) - 1 else "disabled",
-            command=lambda: self._move_to(idx, len(self.games) - 1),
-        )
+        menu.add_command(label=label_cards, command=lambda: self._set_field_all(selected, "cards_done", True if multi else not g["cards_done"]))
+
         menu.add_separator()
 
-        # Toggle flags
-        menu.add_command(
-            label="Mark 2h done" if not g["phase1_done"] else "Mark 2h NOT done",
-            command=lambda: self._toggle_field(idx, "phase1_done"),
-        )
-        menu.add_command(
-            label="Mark cards done" if not g["cards_done"] else "Mark cards NOT done",
-            command=lambda: self._toggle_field(idx, "cards_done"),
-        )
-        menu.add_separator()
-
-        menu.add_command(
-            label="Remove",
-            command=self._remove_game,
-        )
+        if multi:
+            menu.add_command(
+                label=f"Bulk edit playtime for {len(selected)} game(s)",
+                command=lambda: self._bulk_edit(selected, "playtime", "playtime"),
+            )
+            menu.add_command(
+                label=f"Bulk edit drops for {len(selected)} game(s)",
+                command=lambda: self._bulk_edit(selected, "drops", "drops"),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label=f"Remove {len(selected)} game(s)",
+                command=lambda: self._remove_selected(selected),
+            )
+        else:
+            menu.add_command(label="Refresh playtime & drops", command=lambda: self._refresh_single(idx))
+            menu.add_separator()
+            menu.add_command(label="Remove", command=self._remove_game)
 
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _set_field_all(self, indices: list[int], field: str, value):
+        for idx in indices:
+            self.games[idx][field] = value
+        save_games(self.games)
+        self._refresh_table()
+
+    def _remove_selected(self, indices: list[int]):
+        indices_sorted = sorted(indices, reverse=True)
+        for idx in indices_sorted:
+            self.games.pop(idx)
+        self._last_removed = None
+        self._undo_btn.config(state="disabled")
+        save_games(self.games)
+        self._refresh_table()
+        self._append_log(f"Removed {len(indices)} game(s).")
 
     def _move_to(self, src: int, dst: int):
         if src == dst:
@@ -2168,13 +2370,28 @@ class App(tk.Tk):
     # -----------------------------------------------------------------------
 
     def _append_log(self, msg: str):
-        self._log_text.config(state="normal")
-        self._log_text.insert("end", msg + "\n")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self._log_text.insert("end", line + "\n")
         self._log_text.see("end")
-        self._log_text.config(state="disabled")
 
     def _log_from_thread(self, msg: str):
         self.after(0, self._append_log, msg)
+
+    def _copy_log(self):
+        content = self._log_text.get("1.0", "end").strip()
+        self.clipboard_clear()
+        self.clipboard_append(content)
+
+    def _export_log(self):
+        import datetime
+        logs_dir = Path(__file__).parent / "logs"
+        logs_dir.mkdir(exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
+        path = logs_dir / f"log-{ts}.txt"
+        content = self._log_text.get("1.0", "end").strip()
+        path.write_text(content, encoding="utf-8")
+        self._append_log(f"Log exported to logs/log-{ts}.txt")
 
     # -----------------------------------------------------------------------
     # Thread callbacks
@@ -2184,7 +2401,15 @@ class App(tk.Tk):
         self.after(0, self._refresh_table)
 
     def _status_from_thread(self, st: IdleStatus):
-        self.after(0, self._status_panel.update_status, st, self._running)
+        def _apply():
+            self._status_panel.update_status(st, self._running)
+            if self._running and st.phase1_running:
+                self._summary.refresh(
+                    self.games, self._unit,
+                    threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)),
+                    phase1_remaining_sec=st.next_check_sec,
+                )
+        self.after(0, _apply)
 
     def _on_all_done(self):
         self.after(0, self._handle_all_done)
@@ -2203,7 +2428,7 @@ class App(tk.Tk):
     # -----------------------------------------------------------------------
 
     def _open_settings(self):
-        dlg = SettingsDialog(self, self.config)
+        dlg = SettingsDialog(self, self.config, self._unit_var)
         if dlg.result:
             self.config.update(dlg.result)
             save_config(self.config)
@@ -2313,7 +2538,10 @@ class App(tk.Tk):
             return   # user cancelled
 
         hours = parse_playtime(pt, self._unit)
-        self.games.append(default_game(app_id, name or "", hours))
+        thresh = float(self.config.get("phase1_threshold_hours", 2.0))
+        game = default_game(app_id, name or "", hours)
+        game["phase1_done"] = hours >= thresh
+        self.games.append(game)
         save_games(self.games)
         self._refresh_table()
         self._append_log(f"Added App {app_id}" + (f" ({name})" if name else "") + ".")
@@ -2346,6 +2574,38 @@ class App(tk.Tk):
         self._append_log(f"Restored {g['name']} ({g['app_id']}).")
         self._undo_btn.config(state="disabled")
 
+    def _remove_all(self):
+        if not self.games:
+            messagebox.showinfo("Nothing to remove", "The game list is already empty.")
+            return
+        if not messagebox.askyesno(
+            "Remove All",
+            f"Remove all {len(self.games)} game(s) from the list?\n\nThis cannot be undone.",
+        ):
+            return
+        count = len(self.games)
+        self.games.clear()
+        self._last_removed = None
+        self._undo_btn.config(state="disabled")
+        save_games(self.games)
+        self._refresh_table()
+        self._append_log(f"Removed all {count} game(s).")
+
+    def _full_reset(self):
+        if not messagebox.askyesno(
+            "Full Reset",
+            "This will remove all games AND clear all phase/card progress.\n\n"
+            "The list will be completely empty. Are you sure?",
+        ):
+            return
+        count = len(self.games)
+        self.games.clear()
+        self._last_removed = None
+        self._undo_btn.config(state="disabled")
+        save_games(self.games)
+        self._refresh_table()
+        self._append_log(f"Full reset: removed {count} game(s).")
+
     # -----------------------------------------------------------------------
     # Refresh drops
     # -----------------------------------------------------------------------
@@ -2361,7 +2621,7 @@ class App(tk.Tk):
         session_id   = self.config["session_id"]
         login_secure = self.config["login_secure"]
         steam_id     = self.config.get("steam_id", "")
-        games_snapshot = list(self.games)   # app_ids only, read on the bg thread
+        games_snapshot = list(self.games)
 
         def _fetch():
             confirmed: dict[str, int] = {}
@@ -2370,8 +2630,6 @@ class App(tk.Tk):
             except Exception as exc:
                 self.after(0, self._append_log, f"Bulk drop scrape skipped: {exc}")
 
-            # Anything the bulk scrape didn't confirm gets an authoritative
-            # per-app check instead of being left as a guess or wrongly zeroed.
             unresolved = [g for g in games_snapshot if g["app_id"] not in confirmed]
             for i, g in enumerate(unresolved):
                 try:
@@ -2397,9 +2655,62 @@ class App(tk.Tk):
                 unknown = sum(1 for g in self.games if g["cards_remaining"] < 0)
                 msg = f"Drop counts refreshed for {updated}/{len(self.games)} game(s). {still_with_drops} still have drops remaining."
                 if unknown:
-                    msg += f" {unknown} still unknown, couldn't confirm."
+                    msg += f" {unknown} still unknown."
                 self._append_log(msg)
                 self._refresh_btn.config(state="normal")
+            self.after(0, _apply)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _refresh_single(self, idx: int):
+        g = self.games[idx]
+        has_cookies = bool(self.config.get("session_id") and self.config.get("login_secure"))
+        has_api     = bool(self.config.get("api_key") and self.config.get("steam_id"))
+        if not has_cookies and not has_api:
+            messagebox.showinfo("Nothing configured", "Set your API key or cookies in Settings first.")
+            return
+        self._append_log(f"Refreshing {g['name']}...")
+        session_id   = self.config.get("session_id", "")
+        login_secure = self.config.get("login_secure", "")
+        steam_id     = self.config.get("steam_id", "")
+        api_key      = self.config.get("api_key", "")
+        app_id       = g["app_id"]
+
+        def _fetch():
+            new_pt    = None
+            new_drops = None
+            if has_api:
+                try:
+                    fetched = fetch_owned_games(api_key, steam_id)
+                    pt_map  = {f["app_id"]: f["playtime_hours"] for f in fetched}
+                    if app_id in pt_map:
+                        new_pt = pt_map[app_id]
+                except Exception as exc:
+                    self.after(0, self._append_log, f"Playtime fetch failed: {exc}")
+            if has_cookies:
+                try:
+                    new_drops = fetch_app_card_drops(session_id, login_secure, app_id, steam_id)
+                except Exception as exc:
+                    self.after(0, self._append_log, f"Drop check failed: {exc}")
+
+            def _apply():
+                targets = [x for x in self.games if x["app_id"] == app_id]
+                if not targets:
+                    return
+                t = targets[0]
+                thresh = float(self.config.get("phase1_threshold_hours", 2.0))
+                msgs = []
+                if new_pt is not None:
+                    t["playtime_hours"] = new_pt
+                    t["phase1_done"]    = new_pt >= thresh
+                    msgs.append(f"playtime = {new_pt:.1f}h")
+                if new_drops is not None:
+                    t["cards_remaining"] = new_drops
+                    t["cards_done"]      = new_drops == 0
+                    msgs.append(f"drops = {new_drops}")
+                save_games(self.games)
+                self._refresh_table()
+                self._append_log(f"{g['name']}: " + (", ".join(msgs) if msgs else "nothing changed") + ".")
             self.after(0, _apply)
 
         threading.Thread(target=_fetch, daemon=True).start()
@@ -2407,6 +2718,38 @@ class App(tk.Tk):
     # -----------------------------------------------------------------------
     # Idling control
     # -----------------------------------------------------------------------
+
+    def _refresh_playtimes(self):
+        if not self.config.get("api_key") or not self.config.get("steam_id"):
+            messagebox.showinfo("API key required",
+                "Enter your Steam API key and Steam ID in Settings to refresh playtimes.")
+            return
+        self._append_log(f"Refreshing playtimes for {len(self.games)} game(s)...")
+        api_key  = self.config["api_key"]
+        steam_id = self.config["steam_id"]
+        thresh   = float(self.config.get("phase1_threshold_hours", 2.0))
+
+        def _fetch():
+            try:
+                fetched  = fetch_owned_games(api_key, steam_id)
+                pt_map   = {g["app_id"]: g["playtime_hours"] for g in fetched}
+            except Exception as exc:
+                self.after(0, self._append_log, f"Playtime fetch failed: {exc}")
+                return
+
+            def _apply():
+                updated = 0
+                for g in self.games:
+                    if g["app_id"] in pt_map:
+                        g["playtime_hours"] = pt_map[g["app_id"]]
+                        g["phase1_done"]    = g["playtime_hours"] >= thresh
+                        updated += 1
+                save_games(self.games)
+                self._refresh_table()
+                self._append_log(f"Playtimes updated for {updated}/{len(self.games)} game(s).")
+            self.after(0, _apply)
+
+        threading.Thread(target=_fetch, daemon=True).start()
 
     def _start_idling(self):
         if self._running:
