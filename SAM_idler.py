@@ -114,7 +114,9 @@ _DEFAULT_CONFIG = {
     "playtime_unit": "minutes",
     "hide_api_key": True,
     "hide_login_secure": True,
-    "phase1_threshold_hours": 2.0,   # hours; set to 0 for infinite (never auto-stop phase 1)
+    "phase1_threshold_hours": 2.0,
+    "merge_refresh_buttons": False,
+    "auto_remove_completed": False,
 }
 
 
@@ -559,13 +561,14 @@ class IdleStatus:
 # ---------------------------------------------------------------------------
 
 class IdleController:
-    def __init__(self, games: list, config: dict, on_update, on_status, on_log, on_done):
-        self.games     = games
-        self.config    = config
-        self.on_update = on_update
-        self.on_status = on_status
-        self.on_log    = on_log
-        self.on_done   = on_done
+    def __init__(self, games: list, config: dict, on_update, on_status, on_log, on_done, on_auto_remove):
+        self.games         = games
+        self.config        = config
+        self.on_update     = on_update
+        self.on_status     = on_status
+        self.on_log        = on_log
+        self.on_done       = on_done
+        self.on_auto_remove = on_auto_remove
         self._stop  = threading.Event()
         self._next  = threading.Event()
         self._procs: dict[str, IdleProcess] = {}
@@ -918,6 +921,9 @@ class IdleController:
                 self._log(f"Cards done: {g['name']}.")
                 save_games(self.games)
                 self.on_update()
+                # Auto-remove if configured
+                if self.config.get("auto_remove_completed", False):
+                    self.on_auto_remove(g["app_id"])
 
         self._status.active_game   = ""
         self._status.active_app_id = ""
@@ -1176,8 +1182,26 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(thresh_row, text="hours  (set to 0 for infinite — Phase 1 never auto-stops)",
                  bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
 
+        # Merge refresh buttons
+        self._merge_refresh_var = tk.BooleanVar(value=self._cfg.get("merge_refresh_buttons", False))
+        tk.Checkbutton(
+            self,
+            text='Merge "Refresh Drops" and "Refresh Playtimes" into a single "Refresh" button',
+            variable=self._merge_refresh_var,
+            bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
+        ).grid(row=15, column=0, columnspan=2, padx=16, pady=(2, 2), sticky="w")
+
+        # Auto-remove completed
+        self._auto_remove_var = tk.BooleanVar(value=self._cfg.get("auto_remove_completed", False))
+        tk.Checkbutton(
+            self,
+            text="Automatically remove a game from the list once all its cards are dropped",
+            variable=self._auto_remove_var,
+            bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
+        ).grid(row=16, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
+
         bf = tk.Frame(self, bg=BG)
-        bf.grid(row=15, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
+        bf.grid(row=17, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
         tk.Button(bf, text="Save",   bg=ACCENT, fg="#fff", font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self._save
                   ).pack(side="right", padx=(6, 0))
@@ -1214,6 +1238,8 @@ class SettingsDialog(tk.Toplevel):
             "login_secure":            self._login_var.get().strip(),
             "playtime_unit":           self._unit_var.get(),
             "phase1_threshold_hours":  thresh,
+            "merge_refresh_buttons":   self._merge_refresh_var.get(),
+            "auto_remove_completed":   self._auto_remove_var.get(),
             "hide_api_key":            self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
             "hide_login_secure":       self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
         }
@@ -1703,21 +1729,32 @@ class App(tk.Tk):
                  text="SAM.Game.exe found" if sam_ok else "SAM.Game.exe NOT FOUND",
                  font=FONT, bg=BG, fg=GREEN if sam_ok else RED).pack(side="right")
 
-        # Toolbar
-        tb = tk.Frame(self, bg=BG)
-        tb.pack(fill="x", padx=16, pady=(10, 0))
-        self._mk_btn(tb, "Import from Steam", self._import_library, accent=True).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb, "Add via App ID",    self._add_by_id).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb, "Remove",            self._remove_game).pack(side="left", padx=(0, 6))
-        self._undo_btn = self._mk_btn(tb, "Undo Remove", self._undo_remove)
+        # Toolbar row 1: game management
+        tb1 = tk.Frame(self, bg=BG)
+        tb1.pack(fill="x", padx=16, pady=(10, 0))
+        self._mk_btn(tb1, "Import from Steam", self._import_library, accent=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb1, "Add via App ID",    self._add_by_id).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb1, "Remove",            self._remove_game).pack(side="left", padx=(0, 6))
+        self._undo_btn = self._mk_btn(tb1, "Undo Remove", self._undo_remove)
         self._undo_btn.pack(side="left", padx=(0, 6))
         self._undo_btn.config(state="disabled")
-        self._mk_btn(tb, "Remove All",  self._remove_all,  danger=True).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb, "Full Reset",  self._full_reset,  danger=True).pack(side="left", padx=(0, 6))
-        self._refresh_btn = self._mk_btn(tb, "Refresh Drops", self._refresh_drops)
-        self._refresh_btn.pack(side="left", padx=(0, 6))
-        self._mk_btn(tb, "Refresh Playtimes", self._refresh_playtimes).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb, "Settings", self._open_settings).pack(side="right")
+        self._mk_btn(tb1, "Remove All",        self._remove_all,  danger=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb1, "Full Reset",        self._full_reset,  danger=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb1, "Remove Completed",  self._remove_completed, danger=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb1, "Settings",          self._open_settings).pack(side="right")
+
+        # Toolbar row 2: refresh and control
+        tb2 = tk.Frame(self, bg=BG)
+        tb2.pack(fill="x", padx=16, pady=(4, 0))
+        self._refresh_drops_btn = self._mk_btn(tb2, "Refresh Drops", self._refresh_drops)
+        self._refresh_drops_btn.pack(side="left", padx=(0, 6))
+        self._refresh_pt_btn = self._mk_btn(tb2, "Refresh Playtimes", self._refresh_playtimes)
+        self._refresh_pt_btn.pack(side="left", padx=(0, 6))
+        # Keep _refresh_btn pointing to drops button for compat with existing state changes
+        self._refresh_btn = self._refresh_drops_btn
+        self._mk_btn(tb2, "Force Kill All SAM", self._force_kill_all, danger=True).pack(side="left", padx=(0, 6))
+        # Apply merge/split mode from config
+        self.after(0, self._apply_refresh_button_mode)
 
         # Summary bar
         self._summary = SummaryBar(self)
@@ -1906,11 +1943,14 @@ class App(tk.Tk):
             return f"{val:.3f}d"
         return str(val)
 
-    _FILTER_STRIP_RE = re.compile(r"['\-:()\u2122]")
+    _FILTER_STRIP_RE = re.compile(r"[':()\u2122]")
+    _FILTER_DASH_RE  = re.compile(r"[-_]")
 
     def _filter_normalize(self, s: str) -> str:
-        """Strip punctuation that shouldn't affect matching."""
-        return self._FILTER_STRIP_RE.sub("", s).lower()
+        s = self._FILTER_STRIP_RE.sub("", s)
+        s = self._FILTER_DASH_RE.sub(" ", s)
+        s = re.sub(r"\s+", " ", s).strip().lower()
+        return s
 
     def _sort_by(self, col: str):
         if self._sort_col == col:
@@ -2397,6 +2437,16 @@ class App(tk.Tk):
     # Thread callbacks
     # -----------------------------------------------------------------------
 
+    def _auto_remove_from_thread(self, app_id: str):
+        def _apply():
+            before = len(self.games)
+            self.games = [g for g in self.games if g["app_id"] != app_id]
+            if len(self.games) < before:
+                save_games(self.games)
+                self._refresh_table()
+                self._append_log(f"Auto-removed {app_id} (cards done).")
+        self.after(0, _apply)
+
     def _update_from_thread(self):
         self.after(0, self._refresh_table)
 
@@ -2427,12 +2477,49 @@ class App(tk.Tk):
     # Settings
     # -----------------------------------------------------------------------
 
-    def _open_settings(self):
+    def _apply_refresh_button_mode(self):
+        if self.config.get("merge_refresh_buttons", False):
+            self._refresh_drops_btn.config(text="Refresh", command=self._refresh_all)
+            self._refresh_pt_btn.pack_forget()
+        else:
+            self._refresh_drops_btn.config(text="Refresh Drops", command=self._refresh_drops)
+            self._refresh_pt_btn.pack(side="left", padx=(0, 6), after=self._refresh_drops_btn)
+
+    def _refresh_all(self):
+        self._refresh_drops()
+        self._refresh_playtimes()
+
+    def _force_kill_all(self):
+        import subprocess as sp
+        try:
+            sp.run(["taskkill", "/F", "/IM", "SAM.Game.exe"],
+                   stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            self._append_log("Force killed all SAM.Game.exe processes.")
+        except Exception as exc:
+            self._append_log(f"Force kill failed: {exc}")
+
+    def _remove_completed(self):
+        completed = [g for g in self.games if g["cards_done"]]
+        if not completed:
+            messagebox.showinfo("Nothing to remove", "No games are marked as cards done.")
+            return
+        if not messagebox.askyesno(
+            "Remove Completed",
+            f"Remove {len(completed)} game(s) with all cards dropped?",
+        ):
+            return
+        self.games = [g for g in self.games if not g["cards_done"]]
+        self._last_removed = None
+        self._undo_btn.config(state="disabled")
+        save_games(self.games)
+        self._refresh_table()
+        self._append_log(f"Removed {len(completed)} completed game(s).")
         dlg = SettingsDialog(self, self.config, self._unit_var)
         if dlg.result:
             self.config.update(dlg.result)
             save_config(self.config)
             self._update_cards_hint()
+            self._apply_refresh_button_mode()
 
     # -----------------------------------------------------------------------
     # Import
@@ -2775,6 +2862,7 @@ class App(tk.Tk):
             on_status=self._status_from_thread,
             on_log=self._log_from_thread,
             on_done=self._on_all_done,
+            on_auto_remove=self._auto_remove_from_thread,
         )
         self._thread = threading.Thread(target=self._controller.run, daemon=True)
         self._thread.start()
