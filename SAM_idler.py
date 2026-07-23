@@ -1693,12 +1693,14 @@ class SummaryBar(tk.Frame):
 
 class _WrapRow(tk.Frame):
     """
-    A container that lays out two child frames (set via set_children): the
-    left one anchored to the left edge, the right one anchored to the far
-    right edge -- like a toolbar with actions on the left and Refresh/
-    Settings pinned to the top-right corner. When the window gets too
-    narrow for both to fit on one line, the right block drops to its own
-    row below the left block (still right-aligned) instead of clipping.
+    A container that lays out two child frames (set via set_children),
+    both anchored to the TOP of the container: the left one flush with the
+    left edge, the right one flush with the right edge -- like a toolbar
+    with actions on the left and Refresh/Settings pinned to the top-right
+    corner, even when the left block is taller (e.g. spans two rows).
+    When the window gets too narrow for both to fit on one line, the right
+    block drops to its own row below the left block (still right-aligned)
+    instead of clipping.
     """
 
     def __init__(self, master, **kwargs):
@@ -1711,8 +1713,13 @@ class _WrapRow(tk.Frame):
     def set_children(self, left: tk.Widget, right: tk.Widget):
         self._left = left
         self._right = right
-        self._left.pack(in_=self, side="left", anchor="w")
-        self._right.pack(in_=self, side="right", anchor="e")
+        # anchor="nw"/"ne": pack's anchor controls placement within the
+        # widget's allocated slot on BOTH axes, not just the side it was
+        # packed to. Without the "n", a single-row right block ends up
+        # vertically centered next to a taller multi-row left block instead
+        # of sitting flush with its top.
+        self._left.pack(in_=self, side="left", anchor="nw")
+        self._right.pack(in_=self, side="right", anchor="ne")
         self._stacked = False
         # Widths aren't known until the widgets are drawn; re-check shortly
         # after and on every resize from then on.
@@ -1735,11 +1742,11 @@ class _WrapRow(tk.Frame):
         self._left.pack_forget()
         self._right.pack_forget()
         if should_stack:
-            self._left.pack(in_=self, side="top", anchor="w", fill="x")
-            self._right.pack(in_=self, side="top", anchor="e", fill="x", pady=(6, 0))
+            self._left.pack(in_=self, side="top", anchor="nw", fill="x")
+            self._right.pack(in_=self, side="top", anchor="ne", fill="x", pady=(6, 0))
         else:
-            self._left.pack(in_=self, side="left", anchor="w")
-            self._right.pack(in_=self, side="right", anchor="e")
+            self._left.pack(in_=self, side="left", anchor="nw")
+            self._right.pack(in_=self, side="right", anchor="ne")
 
 
 # ---------------------------------------------------------------------------

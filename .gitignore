@@ -1,11 +1,15 @@
-# Game list (personal data)
+# Runtime data (personal, auto-created on first run)
 idler_games.json
 idler_config.json
+*.corrupt.bak
 
 # Logs
 logs/
 
-# SAM binaries (not redistributable)
+# Debug HTML dumps (can contain session cookie data -- see README)
+debug_html/
+
+# SAM binaries (not redistributable, copied in during setup)
 SAM.Game.exe
 SAM.API.dll
 SAM.Picker.exe
@@ -34,6 +38,5 @@ env/
 Thumbs.db
 Desktop.ini
 .DS_Store
-
 
 other/
