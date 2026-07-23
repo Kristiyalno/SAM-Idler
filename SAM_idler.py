@@ -60,7 +60,7 @@ def _maybe_dump_debug_html(label: str, html: str) -> None:
 
 
 PHASE1_POLL_INTERVAL = 30   # seconds between phase 1 timer checks
-PHASE2_CARD_POLL_MIN = 5    # minutes between automatic card-drop checks
+PHASE2_CARD_POLL_MIN = 5    # default minutes between automatic card-drop checks (configurable in Settings)
 CRASH_CHECK_INTERVAL = 5    # seconds between liveness checks on the idling process
 CRASH_MAX_RETRIES    = 3    # consecutive quick restart attempts before backing off
 CRASH_RETRY_BACKOFF  = 10   # seconds to wait before each quick restart attempt
@@ -117,6 +117,7 @@ _DEFAULT_CONFIG = {
     "phase1_threshold_hours": 2.0,
     "merge_refresh_buttons": False,
     "auto_remove_completed": False,
+    "phase2_poll_minutes": 5.0,
 }
 
 
@@ -835,7 +836,7 @@ class IdleController:
 
             game_start        = time.time()
             last_poll         = time.time()
-            poll_sec          = PHASE2_CARD_POLL_MIN * 60
+            poll_sec          = max(1.0, float(self.config.get("phase2_poll_minutes", PHASE2_CARD_POLL_MIN))) * 60
             paused_secs       = 0.0   # total crash time since game_start, for elapsed_sec
             paused_since_poll = 0.0   # crash time since last_poll, for the poll countdown
             crash_since  = None
@@ -1182,6 +1183,20 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(thresh_row, text="hours  (set to 0 for infinite — Phase 1 never auto-stops)",
                  bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
 
+        # Phase 2 drop-check interval
+        poll_row = tk.Frame(self, bg=BG)
+        poll_row.grid(row=15, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
+        tk.Label(poll_row, text="Check for drops every:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        self._poll_var = tk.StringVar(
+            value=str(self._cfg.get("phase2_poll_minutes", PHASE2_CARD_POLL_MIN))
+        )
+        poll_entry = tk.Entry(poll_row, textvariable=self._poll_var, bg=ENTRY_BG, fg=FG,
+                               font=FONT, relief="flat", insertbackground=FG, width=6)
+        poll_entry.pack(side="left")
+        bind_word_delete(poll_entry)
+        tk.Label(poll_row, text="minutes  (Phase 2, requires session cookies)",
+                 bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+
         # Merge refresh buttons
         self._merge_refresh_var = tk.BooleanVar(value=self._cfg.get("merge_refresh_buttons", False))
         tk.Checkbutton(
@@ -1189,7 +1204,7 @@ class SettingsDialog(tk.Toplevel):
             text='Merge "Refresh Drops" and "Refresh Playtimes" into a single "Refresh" button',
             variable=self._merge_refresh_var,
             bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=15, column=0, columnspan=2, padx=16, pady=(2, 2), sticky="w")
+        ).grid(row=16, column=0, columnspan=2, padx=16, pady=(2, 2), sticky="w")
 
         # Auto-remove completed
         self._auto_remove_var = tk.BooleanVar(value=self._cfg.get("auto_remove_completed", False))
@@ -1198,10 +1213,10 @@ class SettingsDialog(tk.Toplevel):
             text="Automatically remove a game from the list once all its cards are dropped",
             variable=self._auto_remove_var,
             bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=16, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
+        ).grid(row=17, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
 
         bf = tk.Frame(self, bg=BG)
-        bf.grid(row=17, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
+        bf.grid(row=18, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
         tk.Button(bf, text="Save",   bg=ACCENT, fg="#fff", font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self._save
                   ).pack(side="right", padx=(6, 0))
@@ -1231,6 +1246,12 @@ class SettingsDialog(tk.Toplevel):
             thresh = float(self._thresh_var.get().strip().replace(",", "."))
         except ValueError:
             thresh = 2.0
+        try:
+            poll_minutes = float(self._poll_var.get().strip().replace(",", "."))
+            if poll_minutes <= 0:
+                raise ValueError
+        except ValueError:
+            poll_minutes = PHASE2_CARD_POLL_MIN
         self.result = {
             "api_key":                 self._api_key_var.get().strip(),
             "steam_id":                self._steam_id_var.get().strip(),
@@ -1238,6 +1259,7 @@ class SettingsDialog(tk.Toplevel):
             "login_secure":            self._login_var.get().strip(),
             "playtime_unit":           self._unit_var.get(),
             "phase1_threshold_hours":  thresh,
+            "phase2_poll_minutes":     poll_minutes,
             "merge_refresh_buttons":   self._merge_refresh_var.get(),
             "auto_remove_completed":   self._auto_remove_var.get(),
             "hide_api_key":            self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
@@ -1666,6 +1688,61 @@ class SummaryBar(tk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# Wrapping two-block row (used by the toolbar)
+# ---------------------------------------------------------------------------
+
+class _WrapRow(tk.Frame):
+    """
+    A container that lays out two child frames (set via set_children): the
+    left one anchored to the left edge, the right one anchored to the far
+    right edge -- like a toolbar with actions on the left and Refresh/
+    Settings pinned to the top-right corner. When the window gets too
+    narrow for both to fit on one line, the right block drops to its own
+    row below the left block (still right-aligned) instead of clipping.
+    """
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, **kwargs)
+        self._left = None
+        self._right = None
+        self._stacked = None  # tri-state: None = not laid out yet
+        self.bind("<Configure>", self._on_configure)
+
+    def set_children(self, left: tk.Widget, right: tk.Widget):
+        self._left = left
+        self._right = right
+        self._left.pack(in_=self, side="left", anchor="w")
+        self._right.pack(in_=self, side="right", anchor="e")
+        self._stacked = False
+        # Widths aren't known until the widgets are drawn; re-check shortly
+        # after and on every resize from then on.
+        self.after(0, self._reflow)
+
+    def _on_configure(self, event=None):
+        self._reflow()
+
+    def _reflow(self):
+        if self._left is None or self._right is None:
+            return
+        available = self.winfo_width()
+        if available <= 1:
+            return
+        needed = self._left.winfo_reqwidth() + 24 + self._right.winfo_reqwidth()
+        should_stack = needed > available
+        if should_stack == self._stacked:
+            return
+        self._stacked = should_stack
+        self._left.pack_forget()
+        self._right.pack_forget()
+        if should_stack:
+            self._left.pack(in_=self, side="top", anchor="w", fill="x")
+            self._right.pack(in_=self, side="top", anchor="e", fill="x", pady=(6, 0))
+        else:
+            self._left.pack(in_=self, side="left", anchor="w")
+            self._right.pack(in_=self, side="right", anchor="e")
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -1687,6 +1764,9 @@ class App(tk.Tk):
         self._resumed_before = False
         self._sort_col: str = "order"   # column currently sorted by
         self._sort_desc: bool = False   # False = ascending
+        self._undo_stack: list[list[dict]] = []   # snapshots of self.games before each mutation
+        self._redo_stack: list[list[dict]] = []   # snapshots popped by undo, replayable with Ctrl+Y
+        self._undo_limit = 50
 
         # Playtime display unit (kept in sync with a StringVar)
         self._unit_var = tk.StringVar(value=self.config.get("playtime_unit", "minutes"))
@@ -1697,9 +1777,22 @@ class App(tk.Tk):
         self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)))
 
         # Clicking on empty space unfocuses any active entry/cell editor
-        self.bind("<Button-1>", self._maybe_unfocus)
-        self.bind("<Return>",   self._maybe_unfocus)
-        self.bind("<Escape>",   self._maybe_unfocus)
+        self.bind("<Button-1>", self._maybe_unfocus_on_click)
+        self.bind("<Return>",   self._maybe_unfocus_on_key)
+        self.bind("<Escape>",   self._maybe_unfocus_on_key)
+
+        # Global keybinds: undo/redo, and delete/backspace to remove selected
+        # games. Bound on the root so they work regardless of which widget
+        # has focus, but the handlers themselves check focus so they don't
+        # fire while someone is typing in a text entry or editing a cell.
+        # Note: <Control-z> and <Control-Z> are DIFFERENT bindings in Tk --
+        # the capital variant requires Shift too (i.e. Ctrl+Shift+Z). Redo
+        # is bound to Ctrl+Y instead, which is unambiguous and matches the
+        # convention used by most Windows apps.
+        self.bind_all("<Control-z>", self._on_ctrl_z)
+        self.bind_all("<Control-y>", self._on_ctrl_y)
+        self.bind_all("<Delete>",    self._on_delete_key)
+        self.bind_all("<BackSpace>", self._on_delete_key)
 
         for warning in (games_warning, config_warning):
             if warning:
@@ -1729,30 +1822,43 @@ class App(tk.Tk):
                  text="SAM.Game.exe found" if sam_ok else "SAM.Game.exe NOT FOUND",
                  font=FONT, bg=BG, fg=GREEN if sam_ok else RED).pack(side="right")
 
-        # Toolbar row 1: game management
-        tb1 = tk.Frame(self, bg=BG)
-        tb1.pack(fill="x", padx=16, pady=(10, 0))
-        self._mk_btn(tb1, "Import from Steam", self._import_library, accent=True).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb1, "Add via App ID",    self._add_by_id).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb1, "Remove",            self._remove_game).pack(side="left", padx=(0, 6))
-        self._undo_btn = self._mk_btn(tb1, "Undo Remove", self._undo_remove)
-        self._undo_btn.pack(side="left", padx=(0, 6))
-        self._undo_btn.config(state="disabled")
-        self._mk_btn(tb1, "Remove All",        self._remove_all,  danger=True).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb1, "Full Reset",        self._full_reset,  danger=True).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb1, "Remove Completed",  self._remove_completed, danger=True).pack(side="left", padx=(0, 6))
-        self._mk_btn(tb1, "Settings",          self._open_settings).pack(side="right")
+        # Toolbar: a left block (game management, two rows) and a right
+        # block (refresh + settings), inside a wrapping container so the
+        # right block drops below the left block instead of clipping when
+        # the window gets narrow.
+        tb_wrap = _WrapRow(self, bg=BG)
+        tb_wrap.pack(fill="x", padx=16, pady=(10, 0))
 
-        # Toolbar row 2: refresh and control
-        tb2 = tk.Frame(self, bg=BG)
-        tb2.pack(fill="x", padx=16, pady=(4, 0))
-        self._refresh_drops_btn = self._mk_btn(tb2, "Refresh Drops", self._refresh_drops)
+        tb_left = tk.Frame(tb_wrap, bg=BG)
+        tb_left_row1 = tk.Frame(tb_left, bg=BG)
+        tb_left_row1.pack(fill="x")
+        tb_left_row2 = tk.Frame(tb_left, bg=BG)
+        tb_left_row2.pack(fill="x", pady=(6, 0))
+
+        # Row 1: import, add, remove, undo remove
+        self._mk_btn(tb_left_row1, "Import from Steam", self._import_library, accent=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb_left_row1, "Add via App ID",    self._add_by_id).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb_left_row1, "Remove",            self._remove_game).pack(side="left", padx=(0, 6))
+        self._undo_btn = self._mk_btn(tb_left_row1, "Undo Remove", self._undo_remove)
+        self._undo_btn.pack(side="left")
+        self._undo_btn.config(state="disabled")
+
+        # Row 2: remove completed, remove all, full reset, force kill all sam
+        self._mk_btn(tb_left_row2, "Remove Completed",  self._remove_completed, danger=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb_left_row2, "Remove All",        self._remove_all,  danger=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb_left_row2, "Full Reset",        self._full_reset,  danger=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb_left_row2, "Force Kill All SAM", self._force_kill_all, danger=True).pack(side="left")
+
+        tb_right = tk.Frame(tb_wrap, bg=BG)
+        self._refresh_drops_btn = self._mk_btn(tb_right, "Refresh Drops", self._refresh_drops)
         self._refresh_drops_btn.pack(side="left", padx=(0, 6))
-        self._refresh_pt_btn = self._mk_btn(tb2, "Refresh Playtimes", self._refresh_playtimes)
+        self._refresh_pt_btn = self._mk_btn(tb_right, "Refresh Playtimes", self._refresh_playtimes)
         self._refresh_pt_btn.pack(side="left", padx=(0, 6))
         # Keep _refresh_btn pointing to drops button for compat with existing state changes
         self._refresh_btn = self._refresh_drops_btn
-        self._mk_btn(tb2, "Force Kill All SAM", self._force_kill_all, danger=True).pack(side="left", padx=(0, 6))
+        self._mk_btn(tb_right, "Settings", self._open_settings).pack(side="left")
+
+        tb_wrap.set_children(tb_left, tb_right)
         # Apply merge/split mode from config
         self.after(0, self._apply_refresh_button_mode)
 
@@ -1794,7 +1900,7 @@ class App(tk.Tk):
         self._tree.heading("name",     text="Name",      command=lambda: self._sort_by("name"))
         self._tree.heading("playtime", text="Playtime",  command=lambda: self._sort_by("playtime"))
         self._tree.heading("drops",    text="Drops left",command=lambda: self._sort_by("drops"))
-        self._tree.heading("phase1",   text="2h done",   command=lambda: self._sort_by("phase1"))
+        self._tree.heading("phase1",   text="Phase 2",   command=lambda: self._sort_by("phase1"))
         self._tree.heading("cards",    text="Cards done",command=lambda: self._sort_by("cards"))
 
         self._tree.column("order",    width=38,  anchor="center", stretch=False)
@@ -1821,7 +1927,8 @@ class App(tk.Tk):
         of = tk.Frame(self, bg=BG)
         of.pack(fill="x", padx=16, pady=(4, 0))
         self._mk_btn(of, "Move Up",   self._move_up).pack(side="left", padx=(0, 4))
-        self._mk_btn(of, "Move Down", self._move_down).pack(side="left")
+        self._mk_btn(of, "Move Down", self._move_down).pack(side="left", padx=(0, 4))
+        self._mk_btn(of, "Reorder",   self._reorder).pack(side="left")
 
         # Status panel
         self._status_panel = StatusPanel(self)
@@ -1894,16 +2001,109 @@ class App(tk.Tk):
                          activebackground=ACCENT, activeforeground="#fff",
                          font=FONT, relief="flat", padx=10, pady=5, cursor="hand2", bd=0)
 
-    def _maybe_unfocus(self, event=None):
+    def _maybe_unfocus_on_click(self, event=None):
         """
-        Shift keyboard focus to the main window when the user clicks on empty
-        space, presses Enter, or presses Escape. This dismisses any active
-        inline cell editor (which commits on FocusOut) and clears the cursor
-        from any entry widget.
+        Shift keyboard focus to the main window when the user clicks on
+        empty space (not on an input widget). Dismisses any active inline
+        cell editor (which commits on FocusOut) and clears the cursor from
+        any entry widget when clicking elsewhere.
+
+        This used to be bound as one handler shared with <Return>/<Escape>
+        and fired on EVERY click anywhere in the window -- including a click
+        INTO the search box or any other entry -- immediately stealing focus
+        back with focus_set() right after the widget had just set it. That
+        meant an entry could never actually keep keyboard focus after being
+        clicked. We now check what was actually clicked: if it's an
+        entry-like input widget (or something inside one), we leave focus
+        alone and let the click's own default behaviour stand.
         """
+        widget = event.widget if event is not None else None
+        w = widget
+        while w is not None:
+            if isinstance(w, (tk.Entry, tk.Spinbox, ttk.Entry, ttk.Combobox, ttk.Treeview)):
+                return
+            try:
+                parent_name = w.winfo_parent()
+            except tk.TclError:
+                break
+            w = w.nametowidget(parent_name) if parent_name else None
+
         focused = self.focus_get()
         if focused and focused is not self:
             self.focus_set()
+
+    def _maybe_unfocus_on_key(self, event=None):
+        """Return/Escape always dismiss focus, regardless of what's focused."""
+        focused = self.focus_get()
+        if focused and focused is not self:
+            self.focus_set()
+
+    # -----------------------------------------------------------------------
+    # Undo / redo stack (Ctrl+Z / Ctrl+Y) -- covers edits, bulk edits,
+    # toggles, reorders, and removals with a single mechanism: snapshot
+    # self.games before any mutating action, restore the most recent
+    # snapshot on undo, and step back forward through undone snapshots
+    # with redo.
+    # -----------------------------------------------------------------------
+
+    def _push_undo(self):
+        """Snapshot the current game list before a mutating action."""
+        snapshot = [dict(g) for g in self.games]
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        # A fresh action invalidates whatever redo history existed --
+        # otherwise redoing after a new edit could jump to a state that no
+        # longer makes sense next to what was just done.
+        self._redo_stack.clear()
+
+    def _on_ctrl_z(self, event=None):
+        # Don't hijack Ctrl+Z while the user is editing text somewhere
+        # (an open cell editor, the search box, a settings field, etc.) --
+        # let the widget's own native undo/typing behaviour happen instead.
+        focused = self.focus_get()
+        if isinstance(focused, (tk.Entry, tk.Spinbox, ttk.Entry, ttk.Combobox, tk.Text)):
+            return
+        self._undo()
+
+    def _on_ctrl_y(self, event=None):
+        # Same guard as Ctrl+Z: don't hijack Ctrl+Y while typing.
+        focused = self.focus_get()
+        if isinstance(focused, (tk.Entry, tk.Spinbox, ttk.Entry, ttk.Combobox, tk.Text)):
+            return
+        self._redo()
+
+    def _undo(self):
+        if not self._undo_stack:
+            self._append_log("Nothing to undo.")
+            return
+        self._redo_stack.append([dict(g) for g in self.games])
+        self.games[:] = self._undo_stack.pop()
+        save_games(self.games)
+        self._refresh_table()
+        self._append_log("Undid last change.")
+
+    def _redo(self):
+        if not self._redo_stack:
+            self._append_log("Nothing to redo.")
+            return
+        self._undo_stack.append([dict(g) for g in self.games])
+        self.games[:] = self._redo_stack.pop()
+        save_games(self.games)
+        self._refresh_table()
+        self._append_log("Redid last undone change.")
+
+    def _on_delete_key(self, event=None):
+        # Don't hijack Delete/Backspace while typing in a text entry --
+        # only treat it as "remove selected game(s)" when the table itself
+        # (or nothing in particular) has focus.
+        focused = self.focus_get()
+        if isinstance(focused, (tk.Entry, tk.Spinbox, ttk.Entry, ttk.Combobox, tk.Text)):
+            return
+        selected = self._selected_indices()
+        if not selected:
+            return
+        self._remove_selected(selected)
 
     # -----------------------------------------------------------------------
     # Unit change
@@ -2003,7 +2203,7 @@ class App(tk.Tk):
             "name":     "Name",
             "playtime": "Playtime",
             "drops":    "Drops left",
-            "phase1":   "2h done",
+            "phase1":   "Phase 2",
             "cards":    "Cards done",
         }
         arrow = " ↓" if self._sort_desc else " ↑"
@@ -2107,6 +2307,7 @@ class App(tk.Tk):
             g0 = self.games[int(iid)]
             new_val = not g0[col_name if col_name != "phase1" else "phase1_done"]
             field = "phase1_done" if col_name == "phase1" else "cards_done"
+            self._push_undo()
             for idx in indices:
                 self.games[idx][field] = new_val
             save_games(self.games)
@@ -2141,6 +2342,7 @@ class App(tk.Tk):
             raw = simpledialog.askstring("Bulk Edit", prompt, parent=self)
             if raw is None:
                 return
+            self._push_undo()
             hours = parse_playtime(raw, self._unit)
             for idx in indices:
                 self.games[idx]["playtime_hours"] = hours
@@ -2151,6 +2353,7 @@ class App(tk.Tk):
             )
             if raw is None:
                 return
+            self._push_undo()
             try:
                 drops = int(raw.strip())
             except ValueError:
@@ -2165,6 +2368,7 @@ class App(tk.Tk):
             )
             if raw is None:
                 return
+            self._push_undo()
             for idx in indices:
                 self.games[idx]["name"] = raw.strip() or self.games[idx]["name"]
         save_games(self.games)
@@ -2183,6 +2387,7 @@ class App(tk.Tk):
                 return
             new_pos = max(0, min(new_pos, len(self.games) - 1))
             if new_pos != idx:
+                self._push_undo()
                 item = self.games.pop(idx)
                 self.games.insert(new_pos, item)
                 save_games(self.games)
@@ -2195,6 +2400,7 @@ class App(tk.Tk):
         if col_name == "name":
             stripped = raw_val.strip()
             if stripped:
+                self._push_undo()
                 g["name"] = stripped
             save_games(self.games)
             self._refresh_table()
@@ -2205,6 +2411,7 @@ class App(tk.Tk):
             if not digits:
                 self._append_log(f"App ID edit: '{raw_val}' has no digits, App ID left unchanged.")
                 return
+            self._push_undo()
             if digits != g["app_id"] and any(other["app_id"] == digits for other in self.games if other is not g):
                 self._append_log(f"App ID {digits} is already used elsewhere in the list, but changing it anyway.")
             g["app_id"] = digits
@@ -2213,6 +2420,7 @@ class App(tk.Tk):
             return
 
         if col_name == "playtime":
+            self._push_undo()
             hours = parse_playtime(raw_val, self._unit)
             g["playtime_hours"] = hours
             g["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 2.0))
@@ -2225,6 +2433,7 @@ class App(tk.Tk):
                 drops = int(raw_val.strip())
             except ValueError:
                 return
+            self._push_undo()
             g["cards_remaining"] = drops
             if drops == 0:
                 g["cards_done"] = True
@@ -2281,8 +2490,8 @@ class App(tk.Tk):
 
         # Toggle flags (works for single and multi)
         thresh = float(self.config.get("phase1_threshold_hours", 2.0))
-        label_2h = f"Mark {len(selected)} game(s) 2h done" if multi else (
-            "Mark 2h done" if not g["phase1_done"] else "Mark 2h NOT done"
+        label_2h = f"Mark {len(selected)} game(s) Phase 2 ready" if multi else (
+            "Mark Phase 2 ready" if not g["phase1_done"] else "Mark Phase 2 NOT ready"
         )
         menu.add_command(label=label_2h, command=lambda: self._set_field_all(selected, "phase1_done", True if multi else not g["phase1_done"]))
 
@@ -2315,12 +2524,14 @@ class App(tk.Tk):
         menu.tk_popup(event.x_root, event.y_root)
 
     def _set_field_all(self, indices: list[int], field: str, value):
+        self._push_undo()
         for idx in indices:
             self.games[idx][field] = value
         save_games(self.games)
         self._refresh_table()
 
     def _remove_selected(self, indices: list[int]):
+        self._push_undo()
         indices_sorted = sorted(indices, reverse=True)
         for idx in indices_sorted:
             self.games.pop(idx)
@@ -2333,6 +2544,7 @@ class App(tk.Tk):
     def _move_to(self, src: int, dst: int):
         if src == dst:
             return
+        self._push_undo()
         game = self.games.pop(src)
         self.games.insert(dst, game)
         save_games(self.games)
@@ -2341,6 +2553,7 @@ class App(tk.Tk):
             self._tree.selection_set(str(dst))
 
     def _toggle_field(self, idx: int, field: str):
+        self._push_undo()
         g = self.games[idx]
         g[field] = not g[field]
         save_games(self.games)
@@ -2372,6 +2585,7 @@ class App(tk.Tk):
         target = self._tree.identify_row(event.y)
         if target and target != self._drag_item and getattr(self, "_drag_moved", False):
             src, dst = int(self._drag_item), int(target)
+            self._push_undo()
             item = self.games.pop(src)
             self.games.insert(dst, item)
             save_games(self.games)
@@ -2389,6 +2603,7 @@ class App(tk.Tk):
         idx = self._selected_index()
         if idx is None or idx == 0:
             return
+        self._push_undo()
         self.games[idx - 1], self.games[idx] = self.games[idx], self.games[idx - 1]
         save_games(self.games)
         self._refresh_table()
@@ -2399,11 +2614,37 @@ class App(tk.Tk):
         idx = self._selected_index()
         if idx is None or idx >= len(self.games) - 1:
             return
+        self._push_undo()
         self.games[idx], self.games[idx + 1] = self.games[idx + 1], self.games[idx]
         save_games(self.games)
         self._refresh_table()
         if self._tree.exists(str(idx + 1)):
             self._tree.selection_set(str(idx + 1))
+
+    def _reorder(self):
+        """
+        Commit whatever order the table is currently sorted/displayed in as
+        the new Phase 2 list order (the '#' column). E.g. sort by Drops
+        descending, then click Reorder, to prioritize games with the most
+        drops left without having to drag everything by hand.
+        """
+        if not self.games:
+            return
+        if self._sort_col == "order":
+            messagebox.showinfo(
+                "Reorder",
+                "The table is already showing list order (# column).\n"
+                "Sort by a different column first (e.g. Drops left), then click Reorder.",
+            )
+            return
+        self._push_undo()
+        new_order = [g for _, g in self._sorted_games_for_display()]
+        self.games[:] = new_order
+        self._sort_col = "order"
+        self._sort_desc = False
+        save_games(self.games)
+        self._refresh_table()
+        self._append_log(f"Reordered list to match current sort ({len(new_order)} game(s)).")
 
     # -----------------------------------------------------------------------
     # Log
@@ -2440,7 +2681,17 @@ class App(tk.Tk):
     def _auto_remove_from_thread(self, app_id: str):
         def _apply():
             before = len(self.games)
-            self.games = [g for g in self.games if g["app_id"] != app_id]
+            # Mutate in place: self.games is the same list object the
+            # IdleController thread holds a reference to. Reassigning
+            # self.games here would leave the controller iterating and
+            # re-saving its own stale copy (with this game still in it)
+            # forever, which is why auto-remove used to silently do nothing.
+            #
+            # Deliberately not pushed onto the Ctrl+Z undo stack: this fires
+            # unattended in the background while idling, possibly many times
+            # over a long session, and would otherwise bury the manual edit
+            # the user actually meant to undo under automatic removals.
+            self.games[:] = [g for g in self.games if g["app_id"] != app_id]
             if len(self.games) < before:
                 save_games(self.games)
                 self._refresh_table()
@@ -2483,11 +2734,12 @@ class App(tk.Tk):
             self._refresh_pt_btn.pack_forget()
         else:
             self._refresh_drops_btn.config(text="Refresh Drops", command=self._refresh_drops)
-            self._refresh_pt_btn.pack(side="left", padx=(0, 6), after=self._refresh_drops_btn)
+            if not self._refresh_pt_btn.winfo_ismapped():
+                self._refresh_pt_btn.pack(side="left", padx=(0, 6))
 
-    def _refresh_all(self):
-        self._refresh_drops()
-        self._refresh_playtimes()
+    def _refresh_all(self, silent: bool = False):
+        self._refresh_drops(silent=silent)
+        self._refresh_playtimes(silent=silent)
 
     def _force_kill_all(self):
         import subprocess as sp
@@ -2508,12 +2760,22 @@ class App(tk.Tk):
             f"Remove {len(completed)} game(s) with all cards dropped?",
         ):
             return
-        self.games = [g for g in self.games if not g["cards_done"]]
+        self._push_undo()
+        # Mutate the list in place (not a reassignment) so any running
+        # IdleController, which holds a reference to this same list object,
+        # sees the removal too instead of keeping a stale copy around.
+        self.games[:] = [g for g in self.games if not g["cards_done"]]
         self._last_removed = None
         self._undo_btn.config(state="disabled")
         save_games(self.games)
         self._refresh_table()
         self._append_log(f"Removed {len(completed)} completed game(s).")
+
+    # -----------------------------------------------------------------------
+    # Settings
+    # -----------------------------------------------------------------------
+
+    def _open_settings(self):
         dlg = SettingsDialog(self, self.config, self._unit_var)
         if dlg.result:
             self.config.update(dlg.result)
@@ -2567,15 +2829,16 @@ class App(tk.Tk):
         dlg = ImportDialog(self, fetched, existing, unit=self._unit)
         added = 0
         skipped = 0
-        for g in dlg.selected:
-            if g["app_id"] not in existing:
-                self.games.append(default_game(
-                    g["app_id"], g["name"], g["playtime_hours"],
-                    g.get("cards_remaining", -1),
-                ))
-                added += 1
-            else:
-                skipped += 1
+        to_add = [g for g in dlg.selected if g["app_id"] not in existing]
+        if to_add:
+            self._push_undo()
+        for g in to_add:
+            self.games.append(default_game(
+                g["app_id"], g["name"], g["playtime_hours"],
+                g.get("cards_remaining", -1),
+            ))
+            added += 1
+        skipped = len(dlg.selected) - added
         if added:
             save_games(self.games)
             self._refresh_table()
@@ -2626,6 +2889,7 @@ class App(tk.Tk):
 
         hours = parse_playtime(pt, self._unit)
         thresh = float(self.config.get("phase1_threshold_hours", 2.0))
+        self._push_undo()
         game = default_game(app_id, name or "", hours)
         game["phase1_done"] = hours >= thresh
         self.games.append(game)
@@ -2642,6 +2906,7 @@ class App(tk.Tk):
         if idx is None:
             messagebox.showinfo("Select a game", "Select a game first.")
             return
+        self._push_undo()
         g = self.games.pop(idx)
         self._last_removed = (idx, g)
         save_games(self.games)
@@ -2667,9 +2932,10 @@ class App(tk.Tk):
             return
         if not messagebox.askyesno(
             "Remove All",
-            f"Remove all {len(self.games)} game(s) from the list?\n\nThis cannot be undone.",
+            f"Remove all {len(self.games)} game(s) from the list?\n\nThis can be undone with Ctrl+Z.",
         ):
             return
+        self._push_undo()
         count = len(self.games)
         self.games.clear()
         self._last_removed = None
@@ -2682,9 +2948,10 @@ class App(tk.Tk):
         if not messagebox.askyesno(
             "Full Reset",
             "This will remove all games AND clear all phase/card progress.\n\n"
-            "The list will be completely empty. Are you sure?",
+            "The list will be completely empty. This can be undone with Ctrl+Z. Are you sure?",
         ):
             return
+        self._push_undo()
         count = len(self.games)
         self.games.clear()
         self._last_removed = None
@@ -2697,10 +2964,13 @@ class App(tk.Tk):
     # Refresh drops
     # -----------------------------------------------------------------------
 
-    def _refresh_drops(self):
+    def _refresh_drops(self, silent: bool = False):
         if not self.config.get("session_id") or not self.config.get("login_secure"):
-            messagebox.showinfo("Cookies required",
-                "Enter your sessionid and steamLoginSecure in Settings first.")
+            if silent:
+                self._append_log("Skipped drop refresh: no session cookies set in Settings.")
+            else:
+                messagebox.showinfo("Cookies required",
+                    "Enter your sessionid and steamLoginSecure in Settings first.")
             return
         self._append_log(f"Refreshing card drop counts for {len(self.games)} game(s)...")
         self._refresh_btn.config(state="disabled")
@@ -2806,10 +3076,13 @@ class App(tk.Tk):
     # Idling control
     # -----------------------------------------------------------------------
 
-    def _refresh_playtimes(self):
+    def _refresh_playtimes(self, silent: bool = False):
         if not self.config.get("api_key") or not self.config.get("steam_id"):
-            messagebox.showinfo("API key required",
-                "Enter your Steam API key and Steam ID in Settings to refresh playtimes.")
+            if silent:
+                self._append_log("Skipped playtime refresh: no API key/Steam ID set in Settings.")
+            else:
+                messagebox.showinfo("API key required",
+                    "Enter your Steam API key and Steam ID in Settings to refresh playtimes.")
             return
         self._append_log(f"Refreshing playtimes for {len(self.games)} game(s)...")
         api_key  = self.config["api_key"]
@@ -2854,6 +3127,11 @@ class App(tk.Tk):
         self._start_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
         self._cards_btn.config(state="normal")
+
+        # Refresh drop counts and playtimes first so Phase 1/2 decisions use
+        # current data. Silent: if cookies/API key aren't set this just logs
+        # instead of popping a dialog in the way of starting the session.
+        self._refresh_all(silent=True)
 
         self._controller = IdleController(
             games=self.games,

@@ -2,6 +2,9 @@
 idler_games.json
 idler_config.json
 
+# Logs
+logs/
+
 # SAM binaries (not redistributable)
 SAM.Game.exe
 SAM.API.dll

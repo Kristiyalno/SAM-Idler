@@ -8,7 +8,7 @@ SAM Idler launches `SAM.Game.exe` as a subprocess with the target App ID as an a
 
 **Phase 1** runs all games that haven't hit the playtime threshold simultaneously. Each game is stopped individually once it reaches the threshold, and Phase 1 completes once every game is done. The threshold defaults to 2 hours but is configurable in Settings, including an infinite mode that never auto-stops.
 
-**Phase 2** idles each remaining game one at a time in list order. Drop counts are checked every 5 minutes via each game's own gamecards page. When a game hits 0 drops the idler moves on automatically.
+**Phase 2** idles each remaining game one at a time in list order. Drop counts are checked every 5 minutes by default (configurable in Settings) via each game's own gamecards page. When a game hits 0 drops the idler moves on automatically.
 
 If `SAM.Game.exe` crashes during a session, the idler detects it and tries to restart it. If it won't restart after several attempts, the game's timer is paused and retries continue every 5 minutes in the background.
 
@@ -44,7 +44,7 @@ If either JSON file gets corrupted it is automatically backed up and reset on ne
 
 ## Configuration (Settings window)
 
-Open **Settings** in the top-right corner of row 1.
+Open **Settings** on the right side of the toolbar.
 
 **Steam Web API** (library import, playtime refresh)
 - API Key: get one at https://steamcommunity.com/dev/apikey — the domain field can be anything, e.g. `localhost`
@@ -60,6 +60,7 @@ The API key and `steamLoginSecure` fields have a **Hide** checkbox (enabled by d
 **Display & behaviour**
 - **Playtime unit** — minutes (default), hours, seconds, or days. Takes effect immediately everywhere.
 - **Phase 1 stops each game at** — hours before stopping a game. Default 2. Set to 0 for infinite mode.
+- **Check for drops every** — minutes between automatic Phase 2 drop checks. Default 5. Requires session cookies.
 - **Merge Refresh buttons** — combine Refresh Drops and Refresh Playtimes into a single Refresh button.
 - **Auto-remove completed** — automatically remove a game from the list once all its cards are dropped.
 
@@ -102,7 +103,7 @@ Double-click any cell to edit inline. Click elsewhere, Enter, or Escape to commi
 | Name | Edit the game name |
 | Playtime | Type a new value in the current unit; phase 1 status updates automatically |
 | Drops left | Type a number; setting it to 0 also marks cards done |
-| 2h done | Double-click to toggle yes/no |
+| Phase 2 | Double-click to toggle yes/no — whether the game has cleared the Phase 1 threshold and is ready for Phase 2 |
 | Cards done | Double-click to toggle yes/no |
 
 ### Multi-select editing
@@ -111,9 +112,15 @@ Ctrl+click or Shift+click to select multiple rows. Double-clicking Name, Playtim
 
 ### Right-click menu
 
-Single row: Move to top / up / down / bottom, toggle 2h done / cards done, Refresh playtime & drops for that one game, Remove.
+Single row: Move to top / up / down / bottom, toggle Phase 2 ready / cards done, Refresh playtime & drops for that one game, Remove.
 
-Multiple rows: Mark all 2h done, mark all cards done, bulk edit playtime, bulk edit drops, remove all selected.
+Multiple rows: Mark all Phase 2 ready, mark all cards done, bulk edit playtime, bulk edit drops, remove all selected.
+
+### Keyboard shortcuts
+
+- **Ctrl+Z** — undo the last change: edits, bulk edits, toggles, reordering, and removals (including Remove All and Full Reset). Doesn't fire while you're typing in a text field.
+- **Ctrl+Y** — redo the last undone change. Doesn't fire while you're typing in a text field.
+- **Delete** / **Backspace** — remove the selected game(s), same as the Remove button. Doesn't fire while you're typing in a text field.
 
 ## Reordering
 
@@ -122,8 +129,9 @@ Phase 2 idles in list order (`#` column). To change priority:
 - Use **Move Up / Move Down** below the table
 - Double-click `#` and type a position number
 - Right-click and use the move options
+- Sort the table by another column (e.g. Drops left) and click **Reorder** to lock that sorted order in as the new list order
 
-Sorting by any column other than `#` is view-only and does not affect Phase 2 idle order.
+Sorting by any column other than `#` is view-only and does not affect Phase 2 idle order until you click **Reorder**.
 
 ## Status panel and log
 
@@ -135,39 +143,44 @@ The log records every event with a full timestamp. You can select and copy text 
 
 ## Pausing and resuming
 
-**Pause** stops all idle processes but saves progress. **Resume Idling** continues exactly where it left off. Closing while running prompts you to pause first.
+**Pause** stops all idle processes but saves progress. **Resume Idling** continues exactly where it left off, and re-checks drops and playtimes automatically first (same as Start Idling — see below). Closing while running prompts you to pause first.
 
 ## Toolbar
 
-The toolbar is split into two rows.
+The toolbar has a left block (game management, two rows) and a right block (refresh and settings) pinned to the top-right corner. The right block drops below the left block on narrow windows instead of clipping, staying right-aligned either way.
 
-**Row 1 — game management**
+**Left block, row 1**
 
 | Button | What it does |
 |---|---|
 | **Import from Steam** | Fetch your full library with playtime and drop counts |
 | **Add via App ID** | Manually add a game by Steam App ID |
 | **Remove** | Remove the selected game |
-| **Undo Remove** | Restore the last removed game (one level of undo) |
-| **Remove All** | Remove every game (asks for confirmation) |
-| **Full Reset** | Remove every game and all progress (asks for confirmation) |
-| **Remove Completed** | Remove all games marked cards done (asks for confirmation) |
-| **Settings** | Open the settings window |
+| **Undo Remove** | Restore the last removed game (one level of undo) — Ctrl+Z also works and covers edits, toggles, and reordering too, not just removals |
 
-**Row 2 — refresh and control**
+**Left block, row 2**
+
+| Button | What it does |
+|---|---|
+| **Remove Completed** | Remove all games marked cards done (asks for confirmation) |
+| **Remove All** | Remove every game (asks for confirmation, undoable with Ctrl+Z) |
+| **Full Reset** | Remove every game and all progress (asks for confirmation, undoable with Ctrl+Z) |
+| **Force Kill All SAM** | Kills every SAM.Game.exe process immediately (equivalent to `taskkill /F /IM SAM.Game.exe`) |
+
+**Right block**
 
 | Button | What it does |
 |---|---|
 | **Refresh Drops** | Update card drop counts for all games (requires cookies) |
 | **Refresh Playtimes** | Update playtimes for all games from the Steam API (requires API key) |
 | **Refresh** | Both of the above merged — shown when merge mode is enabled in Settings |
-| **Force Kill All SAM** | Kills every SAM.Game.exe process immediately (equivalent to `taskkill /F /IM SAM.Game.exe`) |
+| **Settings** | Open the settings window |
 
 **Control row** (below the table)
 
 | Button | What it does |
 |---|---|
-| **Start Idling** / **Resume Idling** | Start or resume the idle session |
+| **Start Idling** / **Resume Idling** | Start or resume the idle session — automatically refreshes drops and playtimes first (silently skipped if cookies/API key aren't set) |
 | **Pause** | Stop all idle processes and save progress |
 | **Cards Dropped (manual)** | Advance Phase 2 without waiting for auto-detection (use when cookies aren't set) |
 
