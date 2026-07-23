@@ -20,6 +20,7 @@ Requirements:
 
 import json
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -1775,6 +1776,21 @@ class App(tk.Tk):
         self._redo_stack: list[list[dict]] = []   # snapshots popped by undo, replayable with Ctrl+Y
         self._undo_limit = 50
 
+        # Thread-safe hand-off from background threads (IdleController's
+        # run loop, and the various *_fetch worker threads) to the GUI
+        # thread. Calling self.after(0, ...) directly FROM a background
+        # thread is not reliably safe -- Tcl/Tk's threading model can raise
+        # "main thread is not in main loop", hang, or silently drop the
+        # call depending on timing and how busy the main loop already is.
+        # This was the real reason auto-remove-completed kept silently not
+        # working even after the game-list reference bug was fixed: the
+        # scheduled removal callback itself was never guaranteed to run.
+        # Background threads only ever put a (callable, args) pair on this
+        # queue; only _drain_dispatch_queue (scheduled by itself, always
+        # running on the GUI thread) ever calls self.after().
+        self._dispatch_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._drain_dispatch_queue()
+
         # Playtime display unit (kept in sync with a StringVar)
         self._unit_var = tk.StringVar(value=self.config.get("playtime_unit", "minutes"))
         self._unit_var.trace_add("write", self._on_unit_change)
@@ -2044,6 +2060,37 @@ class App(tk.Tk):
         focused = self.focus_get()
         if focused and focused is not self:
             self.focus_set()
+
+    # -----------------------------------------------------------------------
+    # Thread-safe dispatch to the GUI thread
+    # -----------------------------------------------------------------------
+
+    def _dispatch(self, fn, *args):
+        """
+        Safe to call from ANY thread, including the IdleController's
+        background thread and the various *_fetch worker threads. Queues
+        fn(*args) to run on the GUI thread shortly. Never calls self.after()
+        directly -- only _drain_dispatch_queue does that, and it always
+        runs on the GUI thread (it reschedules itself), so Tk is never
+        touched from anywhere but the thread that owns it.
+        """
+        self._dispatch_queue.put((fn, args))
+
+    def _drain_dispatch_queue(self):
+        # Runs on the GUI thread only: either the initial call from
+        # __init__, or a reschedule of itself via self.after below.
+        try:
+            while True:
+                fn, args = self._dispatch_queue.get_nowait()
+                try:
+                    fn(*args)
+                except Exception as exc:
+                    # Don't let one bad callback kill the drain loop --
+                    # log it and keep processing the rest of the queue.
+                    print(f"Dispatch callback error: {exc}")
+        except queue.Empty:
+            pass
+        self.after(75, self._drain_dispatch_queue)
 
     # -----------------------------------------------------------------------
     # Undo / redo stack (Ctrl+Z / Ctrl+Y) -- covers edits, bulk edits,
@@ -2664,7 +2711,7 @@ class App(tk.Tk):
         self._log_text.see("end")
 
     def _log_from_thread(self, msg: str):
-        self.after(0, self._append_log, msg)
+        self._dispatch(self._append_log, msg)
 
     def _copy_log(self):
         content = self._log_text.get("1.0", "end").strip()
@@ -2703,10 +2750,10 @@ class App(tk.Tk):
                 save_games(self.games)
                 self._refresh_table()
                 self._append_log(f"Auto-removed {app_id} (cards done).")
-        self.after(0, _apply)
+        self._dispatch(_apply)
 
     def _update_from_thread(self):
-        self.after(0, self._refresh_table)
+        self._dispatch(self._refresh_table)
 
     def _status_from_thread(self, st: IdleStatus):
         def _apply():
@@ -2717,10 +2764,10 @@ class App(tk.Tk):
                     threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)),
                     phase1_remaining_sec=st.next_check_sec,
                 )
-        self.after(0, _apply)
+        self._dispatch(_apply)
 
     def _on_all_done(self):
-        self.after(0, self._handle_all_done)
+        self._dispatch(self._handle_all_done)
 
     def _handle_all_done(self):
         self._running = False
@@ -2811,7 +2858,7 @@ class App(tk.Tk):
             try:
                 games = fetch_owned_games(self.config["api_key"], steam_id)
             except Exception as exc:
-                self.after(0, messagebox.showerror, "Error", f"Library fetch failed:\n{exc}")
+                self._dispatch(messagebox.showerror, "Error", f"Library fetch failed:\n{exc}")
                 return
             # Best-effort: fill in drop counts from the badges list if cookies
             # are set, so the import dialog isn't showing "?" for everything.
@@ -2825,8 +2872,8 @@ class App(tk.Tk):
                         if g["app_id"] in drops:
                             g["cards_remaining"] = drops[g["app_id"]]
                 except Exception as exc:
-                    self.after(0, self._append_log, f"Drop counts unavailable for import: {exc}")
-            self.after(0, self._show_import_dialog, games)
+                    self._dispatch(self._append_log, f"Drop counts unavailable for import: {exc}")
+            self._dispatch(self._show_import_dialog, games)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -2992,7 +3039,7 @@ class App(tk.Tk):
             try:
                 confirmed.update(fetch_card_drops_bulk(session_id, login_secure, steam_id))
             except Exception as exc:
-                self.after(0, self._append_log, f"Bulk drop scrape skipped: {exc}")
+                self._dispatch(self._append_log, f"Bulk drop scrape skipped: {exc}")
 
             unresolved = [g for g in games_snapshot if g["app_id"] not in confirmed]
             for i, g in enumerate(unresolved):
@@ -3001,9 +3048,9 @@ class App(tk.Tk):
                         session_id, login_secure, g["app_id"], steam_id
                     )
                 except Exception as exc:
-                    self.after(0, self._append_log, f"{g['name']}: {exc}")
+                    self._dispatch(self._append_log, f"{g['name']}: {exc}")
                 if (i + 1) % 5 == 0:
-                    self.after(0, self._append_log,
+                    self._dispatch(self._append_log,
                                f"Checked {i + 1}/{len(unresolved)} remaining game(s)...")
 
             def _apply():
@@ -3022,7 +3069,7 @@ class App(tk.Tk):
                     msg += f" {unknown} still unknown."
                 self._append_log(msg)
                 self._refresh_btn.config(state="normal")
-            self.after(0, _apply)
+            self._dispatch(_apply)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -3050,12 +3097,12 @@ class App(tk.Tk):
                     if app_id in pt_map:
                         new_pt = pt_map[app_id]
                 except Exception as exc:
-                    self.after(0, self._append_log, f"Playtime fetch failed: {exc}")
+                    self._dispatch(self._append_log, f"Playtime fetch failed: {exc}")
             if has_cookies:
                 try:
                     new_drops = fetch_app_card_drops(session_id, login_secure, app_id, steam_id)
                 except Exception as exc:
-                    self.after(0, self._append_log, f"Drop check failed: {exc}")
+                    self._dispatch(self._append_log, f"Drop check failed: {exc}")
 
             def _apply():
                 targets = [x for x in self.games if x["app_id"] == app_id]
@@ -3075,7 +3122,7 @@ class App(tk.Tk):
                 save_games(self.games)
                 self._refresh_table()
                 self._append_log(f"{g['name']}: " + (", ".join(msgs) if msgs else "nothing changed") + ".")
-            self.after(0, _apply)
+            self._dispatch(_apply)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -3101,7 +3148,7 @@ class App(tk.Tk):
                 fetched  = fetch_owned_games(api_key, steam_id)
                 pt_map   = {g["app_id"]: g["playtime_hours"] for g in fetched}
             except Exception as exc:
-                self.after(0, self._append_log, f"Playtime fetch failed: {exc}")
+                self._dispatch(self._append_log, f"Playtime fetch failed: {exc}")
                 return
 
             def _apply():
@@ -3114,7 +3161,7 @@ class App(tk.Tk):
                 save_games(self.games)
                 self._refresh_table()
                 self._append_log(f"Playtimes updated for {updated}/{len(self.games)} game(s).")
-            self.after(0, _apply)
+            self._dispatch(_apply)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
