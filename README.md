@@ -1,14 +1,18 @@
 # SAM Idler
 
-A lightweight Python/Tkinter GUI for farming Steam trading cards using `SAM.Game.exe` as the idle engine. Automates the standard two-phase workflow: get everything past the playtime threshold first, then farm cards one game at a time.
+A Python/Tkinter GUI for farming Steam trading cards using `SAM.Game.exe` as the idle engine.
 
 ## How it works
 
-SAM Idler launches `SAM.Game.exe` as a subprocess with the target App ID as an argument. Steam registers the process as the game running, which is the same mechanism SAM uses internally. The windows are hidden automatically so nothing appears on your taskbar.
+SAM Idler launches `SAM.Game.exe` as a subprocess with the target App ID as an argument. Steam sees the process as the game running, which is the same mechanism SAM uses internally. The windows are hidden automatically.
 
-**Phase 1** runs all games that haven't hit the playtime threshold simultaneously. Each game is stopped individually once it reaches the threshold, and Phase 1 completes once every game is done. The threshold defaults to 2 hours but is configurable in Settings, including an infinite mode that never auto-stops.
+**Bulk mode** runs all games simultaneously, indefinitely. This is the default behavior (threshold set to 0). Cards drop after you stop idling a game, so keeping everything launched together and stopping games one by one to check is the most practical workflow.
 
-**Phase 2** idles each remaining game one at a time in list order. Drop counts are checked every 5 minutes by default (configurable in Settings) via each game's own gamecards page. When a game hits 0 drops the idler moves on automatically.
+**Timed mode** is an optional variation where each game auto-stops once it hits a configured playtime threshold. Set the threshold in Settings. With the default of 0 it never auto-stops.
+
+**Focused mode** (what the app calls Phase 2) idles each game one at a time in list order. Drop counts are checked every 5 minutes by default (configurable) via each game's own gamecards page. When a game hits 0 drops the idler moves on automatically. This is useful when you want to concentrate drops on specific games.
+
+**Note on the 2-hour myth:** There is no 2-hour playtime threshold for card drops in Steam. Cards drop based on time idled, not a playtime gate. The old default of 2 hours was wrong and has been removed.
 
 If `SAM.Game.exe` crashes during a session, the idler detects it and tries to restart it. If it won't restart after several attempts, the game's timer is paused and retries continue every 5 minutes in the background.
 
@@ -47,7 +51,7 @@ If either JSON file gets corrupted it is automatically backed up and reset on ne
 Open **Settings** on the right side of the toolbar.
 
 **Steam Web API** (library import, playtime refresh)
-- API Key: get one at https://steamcommunity.com/dev/apikey — the domain field can be anything, e.g. `localhost`
+- API Key: get one at https://steamcommunity.com/dev/apikey - the domain field can be anything, e.g. `localhost`
 - Steam ID: paste your 64-bit ID, your full profile URL, or your vanity name, then click **Look up**
 
 **Session cookies** (automatic card-drop detection, optional)
@@ -57,12 +61,12 @@ Open **Settings** on the right side of the toolbar.
 
 The API key and `steamLoginSecure` fields have a **Hide** checkbox (enabled by default, state persists). All text fields support Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+Backspace/Delete, and right-click for a cut/copy/paste menu.
 
-**Display & behaviour**
-- **Playtime unit** — minutes (default), hours, seconds, or days. Takes effect immediately everywhere.
-- **Phase 1 stops each game at** — hours before stopping a game. Default 2. Set to 0 for infinite mode.
-- **Check for drops every** — minutes between automatic Phase 2 drop checks. Default 5. Requires session cookies.
-- **Merge Refresh buttons** — combine Refresh Drops and Refresh Playtimes into a single Refresh button.
-- **Auto-remove completed** — automatically remove a game from the list once all its cards are dropped.
+**Display and behaviour**
+- **Playtime unit** - minutes (default), hours, seconds, or days. Takes effect immediately everywhere.
+- **Phase 1 stops each game at** - hours before auto-stopping in bulk mode. Default 0 (never auto-stop, runs forever).
+- **Check for drops every** - minutes between automatic drop checks in focused mode. Default 5. Requires session cookies.
+- **Merge Refresh buttons** - combine Refresh Drops and Refresh Playtimes into a single Refresh button.
+- **Auto-remove completed** - automatically remove a game from the list once all its cards are dropped.
 
 ## Adding games
 
@@ -72,7 +76,7 @@ Click **Import from Steam** to fetch your entire library with playtime already f
 
 Filter and sort options in the import dialog:
 - Text filter by name or App ID; shows a `x/total` count when active
-- "Only under 2h" checkbox
+- "Only not in list" checkbox to hide games you have already added
 - Sort by App ID, Name, Playtime, or Drops with direction toggle
 - **Select All** / **Select None** / **Invert** / **Select with drops**
 - Filtering and sorting never touch checkbox selections
@@ -86,11 +90,11 @@ Click **Add via App ID**. Cancelling any step cancels the whole thing. App IDs a
 
 ### Search
 
-The search bar above the table filters by name or App ID. Punctuation (`' : ( ) ™`) is ignored and dashes/underscores are treated as spaces, so "half life" matches "Half-Life™". Shows a `x/total` count when active. Has a Clear button.
+The search bar above the table filters by name or App ID. Punctuation (`' : ( ) TM`) is ignored and dashes/underscores are treated as spaces, so "half life" matches "Half-Life". Shows a `x/total` count when active. Has a Clear button.
 
 ### Sorting
 
-Click any column header to sort, click again to flip direction. Active column shows `↑` or `↓`. Defaults to `#` (list order). Unknown drop counts (`?`) sort to the end.
+Click any column header to sort, click again to flip direction. Active column shows an arrow. Defaults to `#` (list order). Unknown drop counts (`?`) sort to the end.
 
 ### Inline editing
 
@@ -101,9 +105,9 @@ Double-click any cell to edit inline. Click elsewhere, Enter, or Escape to commi
 | `#` | Type a new position number to move the row |
 | App ID | Edit the App ID directly |
 | Name | Edit the game name |
-| Playtime | Type a new value in the current unit; phase 1 status updates automatically |
+| Playtime | Type a new value in the current unit; phase status updates if a threshold is set |
 | Drops left | Type a number; setting it to 0 also marks cards done |
-| Phase 2 | Double-click to toggle yes/no — whether the game has cleared the Phase 1 threshold and is ready for Phase 2 |
+| Phase 2 | Double-click to toggle yes/no - whether the game is queued for focused mode |
 | Cards done | Double-click to toggle yes/no |
 
 ### Multi-select editing
@@ -112,42 +116,42 @@ Ctrl+click or Shift+click to select multiple rows. Double-clicking Name, Playtim
 
 ### Right-click menu
 
-Single row: Move to top / up / down / bottom, toggle Phase 2 ready / cards done, Refresh playtime & drops for that one game, Remove.
+Single row: Move to top / up / down / bottom, toggle Phase 2 / cards done, Refresh playtime and drops for that game, Remove.
 
 Multiple rows: Mark all Phase 2 ready, mark all cards done, bulk edit playtime, bulk edit drops, remove all selected.
 
 ### Keyboard shortcuts
 
-- **Ctrl+Z** — undo the last change: edits, bulk edits, toggles, reordering, and removals (including Remove All and Full Reset). Doesn't fire while you're typing in a text field.
-- **Ctrl+Y** — redo the last undone change. Doesn't fire while you're typing in a text field.
-- **Delete** / **Backspace** — remove the selected game(s), same as the Remove button. Doesn't fire while you're typing in a text field.
+- **Ctrl+Z** - undo the last change: edits, bulk edits, toggles, reordering, removals. Does not fire while typing in a text field.
+- **Ctrl+Y** - redo the last undone change. Does not fire while typing in a text field.
+- **Delete** / **Backspace** - remove the selected game(s). Does not fire while typing in a text field.
 
 ## Reordering
 
-Phase 2 idles in list order (`#` column). To change priority:
+Focused mode (Phase 2) idles in list order (`#` column). To change priority:
 - Drag rows up or down
 - Use **Move Up / Move Down** below the table
 - Double-click `#` and type a position number
 - Right-click and use the move options
-- Sort the table by another column (e.g. Drops left) and click **Reorder** to lock that sorted order in as the new list order
+- Sort by another column (e.g. Drops left) and click **Reorder** to lock that order as the new list order
 
-Sorting by any column other than `#` is view-only and does not affect Phase 2 idle order until you click **Reorder**.
+Sorting by any column other than `#` is view-only and does not affect idle order until you click **Reorder**.
 
 ## Status panel and log
 
-The status panel shows the current phase, which game is being idled, how long it has been running, when the next drop check fires, and a live countdown of the longest remaining Phase 1 wait.
+The status panel shows the current phase, which game is being idled, how long it has been running, when the next drop check fires, and a live countdown of the longest remaining bulk-mode wait.
 
 The log records every event with a full timestamp. You can select and copy text in it directly. Buttons next to the Log label:
-- **Copy Log** — copies the entire log to the clipboard
-- **Export Log** — saves to `logs/log-YYYY-MM-DD_HH-MM-SS-mmm.txt`
+- **Copy Log** - copies the entire log to the clipboard
+- **Export Log** - saves to `logs/log-YYYY-MM-DD_HH-MM-SS-mmm.txt`
 
 ## Pausing and resuming
 
-**Pause** stops all idle processes but saves progress. **Resume Idling** continues exactly where it left off, and re-checks drops and playtimes automatically first (same as Start Idling — see below). Closing while running prompts you to pause first.
+**Pause** stops all idle processes but saves progress. **Resume Idling** continues exactly where it left off, and re-checks drops and playtimes first. Closing while running prompts you to pause first.
 
 ## Toolbar
 
-The toolbar has a left block (game management, two rows) and a right block (refresh and settings) pinned to the top-right corner. The right block drops below the left block on narrow windows instead of clipping, staying right-aligned either way.
+The toolbar has a left block (game management, two rows) and a right block (refresh and settings) pinned to the top-right corner. The right block drops below the left block on narrow windows instead of clipping.
 
 **Left block, row 1**
 
@@ -156,7 +160,7 @@ The toolbar has a left block (game management, two rows) and a right block (refr
 | **Import from Steam** | Fetch your full library with playtime and drop counts |
 | **Add via App ID** | Manually add a game by Steam App ID |
 | **Remove** | Remove the selected game |
-| **Undo Remove** | Restore the last removed game (one level of undo) — Ctrl+Z also works and covers edits, toggles, and reordering too, not just removals |
+| **Undo Remove** | Restore the last removed game - Ctrl+Z also works and covers edits, toggles, and reordering |
 
 **Left block, row 2**
 
@@ -164,8 +168,8 @@ The toolbar has a left block (game management, two rows) and a right block (refr
 |---|---|
 | **Remove Completed** | Remove all games marked cards done (asks for confirmation) |
 | **Remove All** | Remove every game (asks for confirmation, undoable with Ctrl+Z) |
-| **Full Reset** | Remove every game and all progress (asks for confirmation, undoable with Ctrl+Z) |
-| **Force Kill All SAM** | Kills every SAM.Game.exe process immediately (equivalent to `taskkill /F /IM SAM.Game.exe`) |
+| **Full Reset** | Remove every game and wipe all settings including API key and cookies (asks for confirmation) |
+| **Force Kill All SAM** | Kills every SAM.Game.exe process immediately |
 
 **Right block**
 
@@ -173,27 +177,25 @@ The toolbar has a left block (game management, two rows) and a right block (refr
 |---|---|
 | **Refresh Drops** | Update card drop counts for all games (requires cookies) |
 | **Refresh Playtimes** | Update playtimes for all games from the Steam API (requires API key) |
-| **Refresh** | Both of the above merged — shown when merge mode is enabled in Settings |
+| **Refresh** | Both of the above merged - shown when merge mode is enabled in Settings |
 | **Settings** | Open the settings window |
 
 **Control row** (below the table)
 
 | Button | What it does |
 |---|---|
-| **Start Idling** / **Resume Idling** | Start or resume the idle session — automatically refreshes drops and playtimes first (silently skipped if cookies/API key aren't set) |
+| **Start Idling** / **Resume Idling** | Start or resume - automatically refreshes drops and playtimes first (silently skipped if credentials are not set) |
 | **Pause** | Stop all idle processes and save progress |
-| **Cards Dropped (manual)** | Advance Phase 2 without waiting for auto-detection (use when cookies aren't set) |
+| **Cards Dropped (manual)** | Advance focused mode without waiting for auto-detection (use when cookies are not set) |
 
 ## Notes
 
-- Games already past the threshold are skipped in Phase 1 automatically
-- If cookies are not set, drop detection falls back to manual
 - This tool does not touch achievements; it only keeps a process alive that Steam sees as in-game
 - The app is always dark mode
-- Running 10-20 games simultaneously in Phase 1 is fine; beyond ~30 you may hit Steam's internal rate limits
+- Running 10-20 games simultaneously in bulk mode is fine; beyond ~30 you may hit Steam's internal rate limits
 
 ## If drop counts show `?`
 
 Most commonly your session cookies have expired. Re-enter `sessionid` and `steamLoginSecure` in Settings. The log will say specifically what failed.
 
-If it still doesn't work after fresh cookies, set the environment variable `SAM_IDLER_DEBUG_HTML=1` before launching; the raw page HTML is saved to `debug_html/` for inspection.
+If it still does not work after fresh cookies, set the environment variable `SAM_IDLER_DEBUG_HTML=1` before launching; the raw page HTML is saved to `debug_html/` for inspection.

@@ -115,7 +115,7 @@ _DEFAULT_CONFIG = {
     "playtime_unit": "minutes",
     "hide_api_key": True,
     "hide_login_secure": True,
-    "phase1_threshold_hours": 2.0,
+    "phase1_threshold_hours": 0.0,
     "merge_refresh_buttons": False,
     "auto_remove_completed": False,
     "phase2_poll_minutes": 5.0,
@@ -657,7 +657,7 @@ class IdleController:
     # Phase 1 ---------------------------------------------------------------
 
     def _run_phase1(self):
-        threshold_h = float(self.config.get("phase1_threshold_hours", 2.0))
+        threshold_h = float(self.config.get("phase1_threshold_hours", 0.0))
         infinite    = threshold_h <= 0.0
 
         if infinite:
@@ -1175,7 +1175,7 @@ class SettingsDialog(tk.Toplevel):
         thresh_row.grid(row=14, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
         tk.Label(thresh_row, text="Phase 1 stops each game at:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
         self._thresh_var = tk.StringVar(
-            value=str(self._cfg.get("phase1_threshold_hours", 2.0))
+            value=str(self._cfg.get("phase1_threshold_hours", 0.0))
         )
         thresh_entry = tk.Entry(thresh_row, textvariable=self._thresh_var, bg=ENTRY_BG, fg=FG,
                                  font=FONT, relief="flat", insertbackground=FG, width=6)
@@ -1245,8 +1245,10 @@ class SettingsDialog(tk.Toplevel):
     def _save(self):
         try:
             thresh = float(self._thresh_var.get().strip().replace(",", "."))
+            if thresh < 0:
+                thresh = 0.0
         except ValueError:
-            thresh = 2.0
+            thresh = 0.0
         try:
             poll_minutes = float(self._poll_var.get().strip().replace(",", "."))
             if poll_minutes <= 0:
@@ -1318,8 +1320,8 @@ class ImportDialog(tk.Toplevel):
         self._filter_count_lbl = tk.Label(ff, text="", bg=BG, fg=GREY, font=SMALL)
         self._filter_count_lbl.pack(side="left", padx=(6, 0))
 
-        self._sub2h_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(ff, text="Only under 2h", variable=self._sub2h_var,
+        self._not_in_list_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(ff, text="Only not in list", variable=self._not_in_list_var,
                        bg=BG, fg=FG, selectcolor=BTN_BG, font=FONT, activebackground=BG,
                        command=self._apply_filter_sort).pack(side="left", padx=(10, 0))
 
@@ -1473,7 +1475,7 @@ class ImportDialog(tk.Toplevel):
 
     def _apply_filter_sort(self):
         ftext = self._filter_var.get().lower().strip()
-        sub2h = self._sub2h_var.get()
+        not_in_list = self._not_in_list_var.get()
 
         # Un-pack everything first so pack order can be rebuilt cleanly.
         for w in self._row_widgets.values():
@@ -1484,7 +1486,7 @@ class ImportDialog(tk.Toplevel):
             app_id = g["app_id"]
             if ftext and ftext not in g["name"].lower() and ftext not in app_id:
                 continue
-            if sub2h and g["playtime_hours"] >= 2.0:
+            if not_in_list and app_id in self._existing:
                 continue
             row = self._row_widgets[app_id]
             row_bg = row["row_bg_even"] if visible_count % 2 == 0 else row["row_bg_odd"]
@@ -1498,7 +1500,7 @@ class ImportDialog(tk.Toplevel):
             visible_count += 1
 
         total = len(self._row_widgets)
-        if ftext or sub2h:
+        if ftext or not_in_list:
             self._filter_count_lbl.config(text=f"{visible_count}/{total}")
         else:
             self._filter_count_lbl.config(text="")
@@ -1663,7 +1665,7 @@ class SummaryBar(tk.Frame):
         self._games_p2    = self._stat(3, "In phase 2")
         self._games_done  = self._stat(4, "Done")
 
-    def refresh(self, games: list, unit: str = "minutes", threshold_h: float = 2.0, phase1_remaining_sec: float | None = None):
+    def refresh(self, games: list, unit: str = "minutes", threshold_h: float = 0.0, phase1_remaining_sec: float | None = None):
         total_drops = sum(g["cards_remaining"] for g in games if g["cards_remaining"] > 0)
         p1   = sum(1 for g in games if not g["phase1_done"])
         p2   = sum(1 for g in games if g["phase1_done"] and not g["cards_done"])
@@ -1797,7 +1799,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._refresh_table()
-        self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)))
+        self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
 
         # Clicking on empty space unfocuses any active entry/cell editor
         self.bind("<Button-1>", self._maybe_unfocus_on_click)
@@ -2178,7 +2180,7 @@ class App(tk.Tk):
         self.config["playtime_unit"] = self._unit
         save_config(self.config)
         self._refresh_table()
-        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)))
+        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
 
     # -----------------------------------------------------------------------
     # Table
@@ -2316,7 +2318,7 @@ class App(tk.Tk):
             else:
                 self._search_count_lbl.config(text="")
 
-        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)))
+        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
 
     # -----------------------------------------------------------------------
     # Inline cell editing
@@ -2400,7 +2402,7 @@ class App(tk.Tk):
             hours = parse_playtime(raw, self._unit)
             for idx in indices:
                 self.games[idx]["playtime_hours"] = hours
-                self.games[idx]["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 2.0))
+                self.games[idx]["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 0.0))
         elif edit_type == "drops":
             raw = simpledialog.askstring(
                 "Bulk Edit", f"Set drops remaining for {len(indices)} game(s):", parent=self
@@ -2477,7 +2479,7 @@ class App(tk.Tk):
             self._push_undo()
             hours = parse_playtime(raw_val, self._unit)
             g["playtime_hours"] = hours
-            g["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 2.0))
+            g["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 0.0))
             save_games(self.games)
             self._refresh_table()
             return
@@ -2543,7 +2545,7 @@ class App(tk.Tk):
             menu.add_separator()
 
         # Toggle flags (works for single and multi)
-        thresh = float(self.config.get("phase1_threshold_hours", 2.0))
+        thresh = float(self.config.get("phase1_threshold_hours", 0.0))
         label_2h = f"Mark {len(selected)} game(s) Phase 2 ready" if multi else (
             "Mark Phase 2 ready" if not g["phase1_done"] else "Mark Phase 2 NOT ready"
         )
@@ -2761,7 +2763,7 @@ class App(tk.Tk):
             if self._running and st.phase1_running:
                 self._summary.refresh(
                     self.games, self._unit,
-                    threshold_h=float(self.config.get("phase1_threshold_hours", 2.0)),
+                    threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)),
                     phase1_remaining_sec=st.next_check_sec,
                 )
         self._dispatch(_apply)
@@ -2942,7 +2944,7 @@ class App(tk.Tk):
             return   # user cancelled
 
         hours = parse_playtime(pt, self._unit)
-        thresh = float(self.config.get("phase1_threshold_hours", 2.0))
+        thresh = float(self.config.get("phase1_threshold_hours", 0.0))
         self._push_undo()
         game = default_game(app_id, name or "", hours)
         game["phase1_done"] = hours >= thresh
@@ -3001,8 +3003,8 @@ class App(tk.Tk):
     def _full_reset(self):
         if not messagebox.askyesno(
             "Full Reset",
-            "This will remove all games AND clear all phase/card progress.\n\n"
-            "The list will be completely empty. This can be undone with Ctrl+Z. Are you sure?",
+            "This will remove all games AND wipe all settings (API key, cookies, preferences).\n\n"
+            "Everything goes back to factory defaults. Are you sure?",
         ):
             return
         self._push_undo()
@@ -3011,8 +3013,18 @@ class App(tk.Tk):
         self._last_removed = None
         self._undo_btn.config(state="disabled")
         save_games(self.games)
+        try:
+            if CONFIG_FILE.exists():
+                CONFIG_FILE.unlink()
+        except Exception:
+            pass
+        self.config.clear()
+        self.config.update(dict(_DEFAULT_CONFIG))
+        self._unit_var.set(self.config.get("playtime_unit", "minutes"))
+        self._apply_refresh_button_mode()
+        self._update_cards_hint()
         self._refresh_table()
-        self._append_log(f"Full reset: removed {count} game(s).")
+        self._append_log(f"Full reset: removed {count} game(s) and cleared all settings.")
 
     # -----------------------------------------------------------------------
     # Refresh drops
@@ -3109,7 +3121,7 @@ class App(tk.Tk):
                 if not targets:
                     return
                 t = targets[0]
-                thresh = float(self.config.get("phase1_threshold_hours", 2.0))
+                thresh = float(self.config.get("phase1_threshold_hours", 0.0))
                 msgs = []
                 if new_pt is not None:
                     t["playtime_hours"] = new_pt
@@ -3141,7 +3153,7 @@ class App(tk.Tk):
         self._append_log(f"Refreshing playtimes for {len(self.games)} game(s)...")
         api_key  = self.config["api_key"]
         steam_id = self.config["steam_id"]
-        thresh   = float(self.config.get("phase1_threshold_hours", 2.0))
+        thresh   = float(self.config.get("phase1_threshold_hours", 0.0))
 
         def _fetch():
             try:
