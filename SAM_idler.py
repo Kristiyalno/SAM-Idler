@@ -204,7 +204,7 @@ def _sanitize_game(entry) -> dict | None:
         "name": name,
         "playtime_hours": playtime,
         "cards_remaining": cards_remaining,
-        "phase1_done": bool(entry.get("phase1_done", playtime >= 2.0)),
+        "phase1_done": bool(entry.get("phase1_done", True)),
         "cards_done": bool(entry.get("cards_done", False)),
     }
 
@@ -255,7 +255,7 @@ def default_game(app_id: str, name: str = "", playtime_h: float = 0.0, cards_rem
         "name": name.strip() or f"App {app_id}",
         "playtime_hours": playtime_h,
         "cards_remaining": cards_remaining,
-        "phase1_done": playtime_h >= 2.0,
+        "phase1_done": True,
         "cards_done": (cards_remaining == 0),
     }
 
@@ -791,10 +791,13 @@ class IdleController:
 
             # Time remaining = the LONGEST individual wait (bottleneck game)
             # since all games run simultaneously — sum is wrong.
+            # In infinite mode there is no target time so set -1 as sentinel.
             timed = [(eh, nh) for _, eh, nh in still_going if eh is not None and nh is not None]
             if timed:
                 max_secs = max((nh - eh) * 3600 for eh, nh in timed)
                 self._status.next_check_sec = max_secs
+            elif infinite:
+                self._status.next_check_sec = -1.0  # sentinel: running indefinitely
             else:
                 self._status.next_check_sec = 0.0
 
@@ -815,7 +818,7 @@ class IdleController:
         if not targets:
             self._status.phase = "Phase 2 skipped (all cards done)"
             self._emit()
-            self._log("No games need Phase 2.")
+            self._log("No games need solo idling.")
             return
 
         self._log(f"Phase 2: {len(targets)} game(s) to card-idle.")
@@ -826,7 +829,7 @@ class IdleController:
 
             self._next.clear()
             app_id = g["app_id"]
-            self._status.phase         = "Phase 2"
+            self._status.phase         = "Solo"
             self._status.active_game   = g["name"]
             self._status.active_app_id = app_id
             self._status.elapsed_sec   = 0.0
@@ -954,7 +957,7 @@ class IdleController:
         self._status.active_game   = ""
         self._status.active_app_id = ""
         self._emit()
-        self._log("Phase 2 complete.")
+        self._log("Solo mode complete.")
         save_games(self.games)
         self.on_update()
 
@@ -1919,42 +1922,83 @@ class SummaryBar(tk.Frame):
         self._build()
 
     def _stat(self, col, label):
-        tk.Label(self, text=label, bg=PANEL_BG, fg=GREY, font=SMALL).grid(
-            row=0, column=col, sticky="w", padx=(0, 4))
+        lbl = tk.Label(self, text=label, bg=PANEL_BG, fg=GREY, font=SMALL)
+        lbl.grid(row=0, column=col, sticky="w", padx=(0, 4))
         val = tk.Label(self, text="", bg=PANEL_BG, fg=FG, font=BIG)
         val.grid(row=1, column=col, sticky="w", padx=(0, 28))
-        return val
+        return lbl, val
 
     def _build(self):
-        self._total_drops = self._stat(0, "Total drops left")
-        self._total_pt    = self._stat(1, "Multi-idle time left")
-        self._games_p1    = self._stat(2, "Not yet solo-ready")
-        self._games_p2    = self._stat(3, "Solo queue")
-        self._games_done  = self._stat(4, "Done")
+        self._lbl_drops,  self._total_drops = self._stat(0, "Total drops left")
+        self._lbl_pt,     self._total_pt    = self._stat(1, "Multi-idle time left")
+        self._lbl_p1,     self._games_p1    = self._stat(2, "Not yet solo-ready")
+        self._lbl_p2,     self._games_p2    = self._stat(3, "Solo queue")
+        self._lbl_done,   self._games_done  = self._stat(4, "Done")
 
-    def refresh(self, games: list, unit: str = "minutes", threshold_h: float = 0.0, phase1_remaining_sec: float | None = None):
+    def _show(self, col, lbl, val, text):
+        lbl.grid(row=0, column=col, sticky="w", padx=(0, 4))
+        val.config(text=text)
+        val.grid(row=1, column=col, sticky="w", padx=(0, 28))
+
+    def _hide(self, lbl, val):
+        lbl.grid_remove()
+        val.grid_remove()
+
+    def refresh(self, games: list, unit: str = "minutes", threshold_h: float = 0.0,
+                phase1_remaining_sec: float | None = None, idle_mode: str = "multi",
+                is_running: bool = False):
         total_drops = sum(g["cards_remaining"] for g in games if g["cards_remaining"] > 0)
-        p1   = sum(1 for g in games if not g["phase1_done"])
-        p2   = sum(1 for g in games if g["phase1_done"] and not g["cards_done"])
         done = sum(1 for g in games if g["cards_done"])
+        drops_text = str(total_drops) if total_drops else (
+            "?" if any(g["cards_remaining"] < 0 for g in games) else "0")
 
-        # Phase 1 time left = LONGEST individual wait (bottleneck), not sum.
-        # Games run simultaneously so the total wait is max(), not sum().
-        if phase1_remaining_sec is not None:
-            disp_val = hours_to_unit(phase1_remaining_sec / 3600, unit)
+        self._show(0, self._lbl_drops, self._total_drops, drops_text)
+        self._show(4, self._lbl_done,  self._games_done,  str(done))
+
+        if idle_mode == "multi_then_solo":
+            # Show all five stats
+            p1 = sum(1 for g in games if not g["phase1_done"])
+            p2 = sum(1 for g in games if g["phase1_done"] and not g["cards_done"])
+
+            if not is_running:
+                if threshold_h <= 0.0:
+                    pt_text = "∞"
+                else:
+                    max_h = max(
+                        (max(0.0, threshold_h - g["playtime_hours"]) for g in games if not g["phase1_done"]),
+                        default=0.0,
+                    )
+                    pt_text = f"~{hours_to_unit(max_h, unit):.0f} {unit}" if max_h > 0 else "0"
+            elif phase1_remaining_sec is None:
+                pt_text = "n/a"
+            elif phase1_remaining_sec < 0:
+                pt_text = "∞"
+            else:
+                pt_text = f"{hours_to_unit(phase1_remaining_sec / 3600, unit):.0f} {unit}"
+
+            self._show(1, self._lbl_pt, self._total_pt, pt_text)
+            self._show(2, self._lbl_p1, self._games_p1, str(p1))
+            self._show(3, self._lbl_p2, self._games_p2, str(p2))
+
+        elif idle_mode == "multi":
+            # Multi-idle time left (∞ or countdown), no solo-ready columns
+            if not is_running:
+                pt_text = "∞" if threshold_h <= 0.0 else "n/a"
+            elif phase1_remaining_sec is not None and phase1_remaining_sec < 0:
+                pt_text = "∞"
+            elif phase1_remaining_sec is not None:
+                pt_text = f"{hours_to_unit(phase1_remaining_sec / 3600, unit):.0f} {unit}"
+            else:
+                pt_text = "n/a"
+            self._show(1, self._lbl_pt, self._total_pt, pt_text)
+            self._hide(self._lbl_p1, self._games_p1)
+            self._hide(self._lbl_p2, self._games_p2)
+
         else:
-            max_h = max(
-                (max(0.0, threshold_h - g["playtime_hours"]) for g in games if not g["phase1_done"]),
-                default=0.0,
-            )
-            disp_val = hours_to_unit(max_h, unit)
-
-        self._total_drops.config(text=str(total_drops) if total_drops else (
-            "?" if any(g["cards_remaining"] < 0 for g in games) else "0"))
-        self._total_pt.config(text=f"{disp_val:.0f} {unit}")
-        self._games_p1.config(text=str(p1))
-        self._games_p2.config(text=str(p2))
-        self._games_done.config(text=str(done))
+            # solo / fast_cycle: no multi phase, no solo-ready concept
+            self._hide(self._lbl_pt, self._total_pt)
+            self._hide(self._lbl_p1, self._games_p1)
+            self._hide(self._lbl_p2, self._games_p2)
 
 
 # ---------------------------------------------------------------------------
@@ -2033,6 +2077,13 @@ class App(tk.Tk):
 
         self.games, games_warning   = load_games()
         self.config, config_warning = load_config()
+
+        # phase1_done is only meaningful in multi_then_solo mode.
+        # In all other modes every game is implicitly solo-ready, so
+        # normalise on load to avoid stale values causing wrong counts.
+        if self.config.get("idle_mode", "multi") != "multi_then_solo":
+            for g in self.games:
+                g["phase1_done"] = True
         self._controller: IdleController | None = None
         self._thread: threading.Thread | None   = None
         self._running = False
@@ -2066,7 +2117,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._refresh_table()
-        self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600))
+        self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600), idle_mode=self.config.get("idle_mode", "multi"), is_running=self._running)
 
         # Clicking on empty space unfocuses any active entry/cell editor
         self.bind("<Button-1>", self._maybe_unfocus_on_click)
@@ -2181,7 +2232,7 @@ class App(tk.Tk):
         list_frame.pack(fill="both", expand=True, padx=16, pady=(8, 0))
 
         tk.Label(list_frame,
-                 text="Drag rows to reorder. Double-click a cell to edit. Phase 2 idles in list order.",
+                 text="Drag rows to reorder. Double-click a cell to edit. Solo mode idles in list order.",
                  font=SMALL, bg=BG, fg=GREY, anchor="w").pack(anchor="w", pady=(0, 4))
 
         cols = ("order", "app_id", "name", "playtime", "drops", "phase1", "cards")
@@ -2193,7 +2244,7 @@ class App(tk.Tk):
         self._tree.heading("name",     text="Name",      command=lambda: self._sort_by("name"))
         self._tree.heading("playtime", text="Playtime",  command=lambda: self._sort_by("playtime"))
         self._tree.heading("drops",    text="Drops left",command=lambda: self._sort_by("drops"))
-        self._tree.heading("phase1",   text="Phase 2",   command=lambda: self._sort_by("phase1"))
+        self._tree.heading("phase1",   text="Solo ready", command=lambda: self._sort_by("phase1"))
         self._tree.heading("cards",    text="Cards done",command=lambda: self._sort_by("cards"))
 
         self._tree.column("order",    width=38,  anchor="center", stretch=False)
@@ -2448,7 +2499,7 @@ class App(tk.Tk):
         self.config["playtime_unit"] = self._unit
         save_config(self.config)
         self._refresh_table()
-        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600))
+        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600), idle_mode=self.config.get("idle_mode", "multi"), is_running=self._running)
 
     # -----------------------------------------------------------------------
     # Table
@@ -2527,7 +2578,7 @@ class App(tk.Tk):
             "name":     "Name",
             "playtime": "Playtime",
             "drops":    "Drops left",
-            "phase1":   "Phase 2",
+            "phase1":   "Solo ready",
             "cards":    "Cards done",
         }
         arrow = " ↓" if self._sort_desc else " ↑"
@@ -2586,7 +2637,7 @@ class App(tk.Tk):
             else:
                 self._search_count_lbl.config(text="")
 
-        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600))
+        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600), idle_mode=self.config.get("idle_mode", "multi"), is_running=self._running)
 
         # Auto-remove sweep: catches manual toggles, bulk edits, startup, etc.
         # The Phase 2 loop has its own call to on_auto_remove for the active
@@ -2619,7 +2670,7 @@ class App(tk.Tk):
                             "yes" if g["cards_done"]  else "no",
                         ),
                         tags=(tag,))
-                self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600))
+                self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600), idle_mode=self.config.get("idle_mode", "multi"), is_running=self._running)
 
     _EDITABLE = {
         "order":    "order",
@@ -2699,7 +2750,7 @@ class App(tk.Tk):
             hours = parse_playtime(raw, self._unit)
             for idx in indices:
                 self.games[idx]["playtime_hours"] = hours
-                self.games[idx]["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
+                self.games[idx]["phase1_done"] = hours >= float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
         elif edit_type == "drops":
             raw = simpledialog.askstring(
                 "Bulk Edit", f"Set drops remaining for {len(indices)} game(s):", parent=self
@@ -2843,8 +2894,8 @@ class App(tk.Tk):
 
         # Toggle flags (works for single and multi)
         thresh = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
-        label_2h = f"Mark {len(selected)} game(s) Phase 2 ready" if multi else (
-            "Mark Phase 2 ready" if not g["phase1_done"] else "Mark Phase 2 NOT ready"
+        label_2h = f"Mark {len(selected)} game(s) solo ready" if multi else (
+            "Mark solo ready" if not g["phase1_done"] else "Mark NOT solo ready"
         )
         menu.add_command(label=label_2h, command=lambda: self._set_field_all(selected, "phase1_done", True if multi else not g["phase1_done"]))
 
@@ -3062,6 +3113,8 @@ class App(tk.Tk):
                     self.games, self._unit,
                     threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600),
                     phase1_remaining_sec=st.next_check_sec,
+                    idle_mode=self.config.get("idle_mode", "multi"),
+                    is_running=True,
                 )
         self._dispatch(_apply)
 
@@ -3141,6 +3194,13 @@ class App(tk.Tk):
             save_config(self.config)
             self._update_cards_hint()
             self._apply_refresh_button_mode()
+            # If mode changed away from multi_then_solo, solo-ready is no
+            # longer a meaningful concept so normalise all games to True.
+            if self.config.get("idle_mode", "multi") != "multi_then_solo":
+                for g in self.games:
+                    g["phase1_done"] = True
+                save_games(self.games)
+            self._refresh_table()
 
     # -----------------------------------------------------------------------
     # Import
