@@ -2,19 +2,33 @@
 
 A Python/Tkinter GUI for farming Steam trading cards using `SAM.Game.exe` as the idle engine.
 
-## How it works
+## How card drops work
 
-SAM Idler launches `SAM.Game.exe` as a subprocess with the target App ID as an argument. Steam sees the process as the game running, which is the same mechanism SAM uses internally. The windows are hidden automatically.
+Cards drop while a game is running. Steam tracks how long a game has been open and delivers drops on a timer, roughly every 30 minutes per card by default (developers can set a different interval). The drop lands in your inventory while the session is still active — you do not need to close the game to receive it.
 
-**Bulk mode** runs all games simultaneously, indefinitely. This is the default behavior (threshold set to 0). Cards drop after you stop idling a game, so keeping everything launched together and stopping games one by one to check is the most practical workflow.
+**Running multiple games at once slows the drop rate per game.** Steam intentionally reduces drop frequency when more than one game is running. The exact amount varies but is significant — two games running simultaneously does not mean two cards arriving twice as fast, it means each card takes considerably longer to arrive.
 
-**Timed mode** is an optional variation where each game auto-stops once it hits a configured playtime threshold. Set the threshold in Settings. With the default of 0 it never auto-stops.
+**Some accounts have a drop delay.** If your account is new or has made a refund request recently, Steam adds a delay before drops start — typically around 2 hours of playtime per game. This is a refund-abuse prevention measure. On an established account with no recent refunds, drops can start within the first session with no specific playtime requirement.
 
-**Focused mode** (what the app calls Phase 2) idles each game one at a time in list order. Drop counts are checked every 5 minutes by default (configurable) via each game's own gamecards page. When a game hits 0 drops the idler moves on automatically. This is useful when you want to concentrate drops on specific games.
+## Idle modes
 
-**Note on the 2-hour myth:** There is no 2-hour playtime threshold for card drops in Steam. Cards drop based on time idled, not a playtime gate. The old default of 2 hours was wrong and has been removed.
+Pick one in Settings depending on what you want.
 
-If `SAM.Game.exe` crashes during a session, the idler detects it and tries to restart it. If it won't restart after several attempts, the game's timer is paused and retries continue every 5 minutes in the background.
+### Multi-idle (default)
+
+Starts all games simultaneously and keeps them running indefinitely. Because everything is running at once, drops per game are slower, but all games are accumulating time in parallel. Good for large libraries where you just want to leave it running overnight and not think about it.
+
+### Solo
+
+Idles one game at a time in list order. Each game gets the full drop rate since nothing else is competing. Requires session cookies for automatic detection — the app checks drop counts every few minutes and moves to the next game automatically when a game hits 0. Without cookies, use the "Cards Dropped (manual)" button to advance manually.
+
+### Multi then solo
+
+Two-phase workflow: first runs all games simultaneously until each one hits a playtime threshold you set, then switches to solo mode for the actual drop farming. This is how Idle Master works. The idea is to get every game past the 2-hour drop delay gate simultaneously (since they all run at once, you only wait 2 hours total instead of 2 hours per game), then solo-idle each one at full drop rate. Only worth using if your account has the 2-hour delay. If it does not, skip straight to solo.
+
+### Fast cycle
+
+Runs all games simultaneously for a set interval, then rapidly stops and restarts each one in sequence to trigger drop delivery, then repeats. Stopping a game session causes Steam to immediately deliver any drop that has already been earned server-side but not yet pushed to your inventory. This is the "fast mode" approach from Idle Master Extended. Can be faster than solo in practice on some accounts, but results vary.
 
 ## Requirements
 
@@ -54,17 +68,20 @@ Open **Settings** on the right side of the toolbar.
 - API Key: get one at https://steamcommunity.com/dev/apikey - the domain field can be anything, e.g. `localhost`
 - Steam ID: paste your 64-bit ID, your full profile URL, or your vanity name, then click **Look up**
 
-**Session cookies** (automatic card-drop detection, optional)
+**Session cookies** (automatic drop detection, optional)
 - `sessionid` and `steamLoginSecure` from your browser while logged into steamcommunity.com
 - Open DevTools (F12) -> Application -> Cookies -> `https://steamcommunity.com`
-- These expire periodically; re-enter them when detection stops working
+- These expire periodically. When drop counts stop updating, re-enter them.
+- Without cookies the app cannot detect drops automatically. Use "Cards Dropped (manual)" instead.
+- You do not need to keep the browser tab open. Cookies persist independently of open tabs.
 
-The API key and `steamLoginSecure` fields have a **Hide** checkbox (enabled by default, state persists). All text fields support Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+Backspace/Delete, and right-click for a cut/copy/paste menu.
+The API key and `steamLoginSecure` fields have a **Hide** checkbox (on by default, state persists). All text fields support Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+Backspace/Delete, and right-click for a cut/copy/paste menu.
 
 **Display and behaviour**
 - **Playtime unit** - minutes (default), hours, seconds, or days. Takes effect immediately everywhere.
-- **Phase 1 stops each game at** - hours before auto-stopping in bulk mode. Default 0 (never auto-stop, runs forever).
-- **Check for drops every** - minutes between automatic drop checks in focused mode. Default 5. Requires session cookies.
+- **Idle mode** - see Idle modes above. Each option has a description in the Settings window.
+- **Switch to solo after** - only shown for "multi then solo" and "fast cycle" modes. For multi then solo this is hours of playtime per game before switching. For fast cycle this is minutes per cycle before stopping and restarting each game.
+- **Check for drops every** - minutes between automatic drop checks in solo and multi then solo modes. Default 5. Requires session cookies.
 - **Merge Refresh buttons** - combine Refresh Drops and Refresh Playtimes into a single Refresh button.
 - **Auto-remove completed** - automatically remove a game from the list once all its cards are dropped.
 
@@ -76,25 +93,25 @@ Click **Import from Steam** to fetch your entire library with playtime already f
 
 Filter and sort options in the import dialog:
 - Text filter by name or App ID; shows a `x/total` count when active
-- "Only not in list" checkbox to hide games you have already added
+- "Only not in list" hides games you have already added
 - Sort by App ID, Name, Playtime, or Drops with direction toggle
 - **Select All** / **Select None** / **Invert** / **Select with drops**
-- Filtering and sorting never touch checkbox selections
+- Filtering and sorting never affect checkbox selections
 - Mouse wheel scrolling works anywhere over the list
 
 ### Add via App ID
 
-Click **Add via App ID**. Cancelling any step cancels the whole thing. App IDs are in the Steam store URL: `store.steampowered.com/app/1091500/` -> `1091500`
+Click **Add via App ID**. Cancelling any step cancels the whole add. App IDs are in the Steam store URL: `store.steampowered.com/app/1091500/` -> `1091500`
 
 ## The game table
 
 ### Search
 
-The search bar above the table filters by name or App ID. Punctuation (`' : ( ) TM`) is ignored and dashes/underscores are treated as spaces, so "half life" matches "Half-Life". Shows a `x/total` count when active. Has a Clear button.
+The search bar above the table filters by name or App ID. Punctuation is ignored and dashes/underscores are treated as spaces, so "half life" matches "Half-Life". Shows a `x/total` count when active. Has a Clear button.
 
 ### Sorting
 
-Click any column header to sort, click again to flip direction. Active column shows an arrow. Defaults to `#` (list order). Unknown drop counts (`?`) sort to the end.
+Click any column header to sort, click again to flip direction. Defaults to `#` (list order). Unknown drop counts (`?`) sort to the end.
 
 ### Inline editing
 
@@ -105,9 +122,9 @@ Double-click any cell to edit inline. Click elsewhere, Enter, or Escape to commi
 | `#` | Type a new position number to move the row |
 | App ID | Edit the App ID directly |
 | Name | Edit the game name |
-| Playtime | Type a new value in the current unit; phase status updates if a threshold is set |
+| Playtime | Type a new value in the current unit |
 | Drops left | Type a number; setting it to 0 also marks cards done |
-| Phase 2 | Double-click to toggle yes/no - whether the game is queued for focused mode |
+| Solo ready | Double-click to toggle yes/no - whether this game is queued for solo mode |
 | Cards done | Double-click to toggle yes/no |
 
 ### Multi-select editing
@@ -116,19 +133,19 @@ Ctrl+click or Shift+click to select multiple rows. Double-clicking Name, Playtim
 
 ### Right-click menu
 
-Single row: Move to top / up / down / bottom, toggle Phase 2 / cards done, Refresh playtime and drops for that game, Remove.
+Single row: Move to top / up / down / bottom, toggle solo ready / cards done, refresh playtime and drops for that game, remove.
 
-Multiple rows: Mark all Phase 2 ready, mark all cards done, bulk edit playtime, bulk edit drops, remove all selected.
+Multiple rows: mark all solo ready, mark all cards done, bulk edit playtime, bulk edit drops, remove all selected.
 
 ### Keyboard shortcuts
 
 - **Ctrl+Z** - undo the last change: edits, bulk edits, toggles, reordering, removals. Does not fire while typing in a text field.
-- **Ctrl+Y** - redo the last undone change. Does not fire while typing in a text field.
+- **Ctrl+Y** - redo. Does not fire while typing in a text field.
 - **Delete** / **Backspace** - remove the selected game(s). Does not fire while typing in a text field.
 
 ## Reordering
 
-Focused mode (Phase 2) idles in list order (`#` column). To change priority:
+Solo mode idles in list order (`#` column). To change priority:
 - Drag rows up or down
 - Use **Move Up / Move Down** below the table
 - Double-click `#` and type a position number
@@ -139,7 +156,7 @@ Sorting by any column other than `#` is view-only and does not affect idle order
 
 ## Status panel and log
 
-The status panel shows the current phase, which game is being idled, how long it has been running, when the next drop check fires, and a live countdown of the longest remaining bulk-mode wait.
+The status panel shows the current mode and game being idled, how long it has been running, and when the next drop check fires.
 
 The log records every event with a full timestamp. You can select and copy text in it directly. Buttons next to the Log label:
 - **Copy Log** - copies the entire log to the clipboard
@@ -147,11 +164,9 @@ The log records every event with a full timestamp. You can select and copy text 
 
 ## Pausing and resuming
 
-**Pause** stops all idle processes but saves progress. **Resume Idling** continues exactly where it left off, and re-checks drops and playtimes first. Closing while running prompts you to pause first.
+**Pause** stops all idle processes but saves progress. **Resume Idling** picks up where it left off and re-checks drops and playtimes first. Closing while running prompts you to pause first.
 
 ## Toolbar
-
-The toolbar has a left block (game management, two rows) and a right block (refresh and settings) pinned to the top-right corner. The right block drops below the left block on narrow windows instead of clipping.
 
 **Left block, row 1**
 
@@ -184,18 +199,18 @@ The toolbar has a left block (game management, two rows) and a right block (refr
 
 | Button | What it does |
 |---|---|
-| **Start Idling** / **Resume Idling** | Start or resume - automatically refreshes drops and playtimes first (silently skipped if credentials are not set) |
+| **Start Idling** / **Resume Idling** | Start or resume - automatically refreshes drops and playtimes first (skipped silently if credentials are not set) |
 | **Pause** | Stop all idle processes and save progress |
-| **Cards Dropped (manual)** | Advance focused mode without waiting for auto-detection (use when cookies are not set) |
+| **Cards Dropped (manual)** | Advance solo mode without waiting for auto-detection (use when cookies are not set) |
 
 ## Notes
 
 - This tool does not touch achievements; it only keeps a process alive that Steam sees as in-game
 - The app is always dark mode
-- Running 10-20 games simultaneously in bulk mode is fine; beyond ~30 you may hit Steam's internal rate limits
+- Running 10-20 games simultaneously is fine; beyond ~30 you may hit Steam rate limits
 
 ## If drop counts show `?`
 
-Most commonly your session cookies have expired. Re-enter `sessionid` and `steamLoginSecure` in Settings. The log will say specifically what failed.
+Most likely your session cookies have expired. Re-enter `sessionid` and `steamLoginSecure` in Settings. The log will say specifically what failed.
 
 If it still does not work after fresh cookies, set the environment variable `SAM_IDLER_DEBUG_HTML=1` before launching; the raw page HTML is saved to `debug_html/` for inspection.

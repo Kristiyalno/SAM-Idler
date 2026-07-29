@@ -1,11 +1,21 @@
 """
 SAM Idler
-Idles games using SAM.Game.exe (same mechanism SAM uses internally).
+Idles Steam games using SAM.Game.exe to farm trading card drops.
 
-Phase 1: Run all games with < 2h playtime simultaneously until each hits 2h.
-Phase 2: Run each game one at a time until cards are confirmed dropped.
+Idle modes (configurable in Settings):
+  multi          - Run all games simultaneously forever. Cards drop while running,
+                   roughly every 30 min per card on a normal account. Running
+                   multiple games at once slows the per-game drop rate but lets
+                   all games clock time in parallel. Good for large libraries.
+  solo           - One game at a time. Checks drops periodically and moves on
+                   automatically. Best per-game drop rate.
+  multi_then_solo- Multi-idle until a playtime threshold, then switch to solo.
+                   Useful for accounts with a drop delay (new accounts or
+                   accounts that have made recent refunds).
+  fast_cycle     - Multi-idle for an interval, then rapidly stop/restart each
+                   game in sequence to flush pending drops, then repeat.
 
-Automatic detection:
+Drop detection:
 - Library + playtime: Steam Web API (requires API key + Steam ID)
 - Card drops remaining: steamcommunity.com/my/gamecards/<appid> per game
   (requires session cookies). The aggregate badges list is only used as a
@@ -115,6 +125,7 @@ _DEFAULT_CONFIG = {
     "playtime_unit": "minutes",
     "hide_api_key": True,
     "hide_login_secure": True,
+    "idle_mode": "multi",
     "phase1_threshold_hours": 0.0,
     "merge_refresh_buttons": False,
     "auto_remove_completed": False,
@@ -934,18 +945,141 @@ class IdleController:
         save_games(self.games)
         self.on_update()
 
+    # Fast cycle ------------------------------------------------------------
+
+    def _run_fast_cycle(self):
+        """
+        Fast cycle mode: start all games simultaneously (same as multi mode),
+        then once they have been running long enough, rapidly stop and restart
+        each one in sequence. Stopping a game causes Steam to flush any pending
+        drop that has already been earned server-side but not yet delivered.
+
+        Drop interval is ~30 min per card on unrestricted accounts. This mode
+        starts all games at once to clock that time in parallel, then cycles
+        through them to collect the drops, then repeats.
+        """
+        targets = [g for g in self.games if not g["cards_done"]]
+        if not targets:
+            self._status.phase = "Nothing to idle (all cards done)"
+            self._emit()
+            self._log("Fast cycle: no games need cards.")
+            return
+
+        cycle_minutes = float(self.config.get("phase1_threshold_hours", 0.5)) or 0.5
+        poll_sec      = max(1.0, float(self.config.get("phase2_poll_minutes", PHASE2_CARD_POLL_MIN))) * 60
+
+        self._log(
+            f"Fast cycle: {len(targets)} game(s). "
+            f"Running all simultaneously for {cycle_minutes:.0f} min, then cycling through each to collect drops."
+        )
+
+        while not self._stop.is_set():
+            # Refresh target list each outer loop in case some finished
+            targets = [g for g in self.games if not g["cards_done"]]
+            if not targets:
+                break
+
+            # Start all games
+            self._status.phase = f"Fast cycle: multi-idling {len(targets)} game(s)"
+            self._status.phase1_running = [g["name"] for g in targets]
+            self._emit()
+
+            for g in targets:
+                if self._stop.is_set():
+                    return
+                try:
+                    self._start_idle(g["app_id"])
+                except Exception as exc:
+                    self._log(f"ERROR starting {g['app_id']}: {exc}")
+
+            # Wait for the cycle duration
+            wait_start = time.time()
+            cycle_sec  = cycle_minutes * 60
+            while not self._stop.is_set():
+                elapsed = time.time() - wait_start
+                self._status.next_check_sec = max(0.0, cycle_sec - elapsed)
+                self._emit()
+                if elapsed >= cycle_sec:
+                    break
+                self._stop.wait(1)
+
+            if self._stop.is_set():
+                return
+
+            # Stop and restart each game briefly to flush pending drops
+            self._status.phase1_running = []
+            for g in targets:
+                if self._stop.is_set():
+                    return
+                if g["cards_done"]:
+                    continue
+                app_id = g["app_id"]
+                self._status.phase      = f"Fast cycle: collecting from {g['name']}"
+                self._status.active_game   = g["name"]
+                self._status.active_app_id = app_id
+                self._emit()
+
+                self._stop_idle(app_id)
+                self._stop.wait(2)   # brief pause so Steam registers the session end
+                if self._stop.is_set():
+                    return
+
+                if self._has_cookies():
+                    drops = self._check_drops(app_id)
+                    g["cards_remaining"] = drops
+                    save_games(self.games)
+                    self.on_update()
+                    if drops == 0:
+                        g["cards_done"] = True
+                        self._log(f"{g['name']}: 0 drops remaining, done.")
+                        save_games(self.games)
+                        self.on_update()
+                        if self.config.get("auto_remove_completed", False):
+                            self.on_auto_remove(app_id)
+                        continue
+                    elif drops > 0:
+                        self._log(f"{g['name']}: {drops} drop(s) remaining.")
+
+                # Restart the game for the next cycle
+                try:
+                    self._start_idle(app_id)
+                except Exception as exc:
+                    self._log(f"ERROR restarting {g['app_id']}: {exc}")
+
+            self._status.active_game   = ""
+            self._status.active_app_id = ""
+
+        self._status.phase1_running = []
+        self._status.phase = "All done"
+        self._emit()
+        self._log("Fast cycle complete.")
+        save_games(self.games)
+        self.on_update()
+
     # Entry -----------------------------------------------------------------
 
     def run(self):
+        mode = self.config.get("idle_mode", "multi")
         try:
-            self._run_phase1()
-            if not self._stop.is_set():
+            if mode == "solo":
+                # Solo mode: skip multi-idle entirely, just do one-at-a-time
                 self._run_phase2()
+            elif mode == "multi_then_solo":
+                # Multi until threshold, then solo for drops
+                self._run_phase1()
+                if not self._stop.is_set():
+                    self._run_phase2()
+            elif mode == "fast_cycle":
+                self._run_fast_cycle()
+            else:
+                # Default: "multi" - run everything simultaneously forever
+                self._run_phase1()   # threshold=0 means infinite multi-idle
+
             if not self._stop.is_set():
                 self._status.phase       = "All done"
                 self._status.active_game = ""
                 self._emit()
-                self._log("All phases complete.")
+                self._log("Session complete.")
                 self.on_done()
         except Exception as exc:
             self._status.phase = f"Error: {exc}"
@@ -1170,23 +1304,75 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(unit_row, text="(affects table, input fields, and summary bar)",
                  bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(10, 0))
 
-        # Phase 1 threshold
-        thresh_row = tk.Frame(self, bg=BG)
-        thresh_row.grid(row=14, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
-        tk.Label(thresh_row, text="Phase 1 stops each game at:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        # Idle mode selector
+        tk.Label(self, text="Idle mode", bg=BG, fg=FG, font=FONT).grid(
+            row=14, column=0, columnspan=2, padx=16, pady=(8, 2), sticky="w")
+
+        _MODE_INFO = [
+            ("multi",
+             "Multi-idle  (default)",
+             "Starts all games at the same time and keeps them running forever.\n"
+             "Cards drop while the game is running, roughly every 30 minutes per card on a normal\n"
+             "account. Running multiple games at once reduces the drop rate per game, so you won't\n"
+             "see cards arriving as fast, but all games are clocking time in parallel.\n"
+             "Use this if you have lots of games and just want to leave it running overnight."),
+            ("solo",
+             "Solo-idle  (one at a time)",
+             "Idles each game one at a time in list order. Gives each game the full drop rate\n"
+             "since nothing else is running. Checks drop count every few minutes (requires\n"
+             "session cookies) and moves on automatically when a game hits 0. Use this if you\n"
+             "have a small list or want to prioritise specific games."),
+            ("multi_then_solo",
+             "Multi then solo",
+             "First runs all games simultaneously until each hits a playtime threshold (set below),\n"
+             "then switches to solo-idle for drops. This is the classic two-phase workflow used by\n"
+             "Idle Master: the multi phase gets every game past the refund-protection gate\n"
+             "simultaneously, then solo phase farms the actual drops one by one at full drop rate.\n"
+             "Useful if your account has a 2-hour drop delay (new accounts or accounts that have\n"
+             "made recent refunds)."),
+            ("fast_cycle",
+             "Fast cycle",
+             "Runs all games simultaneously for a set interval, then rapidly stops and restarts\n"
+             "each one in sequence. Stopping a game causes Steam to deliver any drop that has\n"
+             "already been earned server-side. Rinse and repeat until all cards are collected.\n"
+             "This is the 'fast mode' from Idle Master Extended. May get drops faster than\n"
+             "solo-idle in practice, but results vary by account."),
+        ]
+
+        self._mode_var = tk.StringVar(value=self._cfg.get("idle_mode", "multi"))
+        mode_frame = tk.Frame(self, bg=BG)
+        mode_frame.grid(row=15, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
+
+        for val, label, desc in _MODE_INFO:
+            rb_frame = tk.Frame(mode_frame, bg=BG)
+            rb_frame.pack(anchor="w", pady=(0, 6))
+            tk.Radiobutton(
+                rb_frame, text=label, variable=self._mode_var, value=val,
+                bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG,
+                font=FONT, command=self._on_mode_change,
+            ).pack(anchor="w")
+            tk.Label(rb_frame, text=desc, bg=BG, fg=GREY, font=SMALL,
+                     justify="left").pack(anchor="w", padx=(22, 0))
+
+        # Threshold row (only relevant for multi_then_solo and fast_cycle)
+        self._thresh_frame = tk.Frame(self, bg=BG)
+        self._thresh_frame.grid(row=16, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
+        tk.Label(self._thresh_frame, text="Switch to solo after:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
         self._thresh_var = tk.StringVar(
             value=str(self._cfg.get("phase1_threshold_hours", 0.0))
         )
-        thresh_entry = tk.Entry(thresh_row, textvariable=self._thresh_var, bg=ENTRY_BG, fg=FG,
+        thresh_entry = tk.Entry(self._thresh_frame, textvariable=self._thresh_var, bg=ENTRY_BG, fg=FG,
                                  font=FONT, relief="flat", insertbackground=FG, width=6)
         thresh_entry.pack(side="left")
         bind_word_delete(thresh_entry)
-        tk.Label(thresh_row, text="hours  (set to 0 for infinite — Phase 1 never auto-stops)",
+        tk.Label(self._thresh_frame,
+                 text="hours of playtime per game  (multi_then_solo) / minutes per cycle  (fast_cycle)",
                  bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+        self._on_mode_change()  # set initial visibility
 
         # Phase 2 drop-check interval
         poll_row = tk.Frame(self, bg=BG)
-        poll_row.grid(row=15, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
+        poll_row.grid(row=17, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
         tk.Label(poll_row, text="Check for drops every:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
         self._poll_var = tk.StringVar(
             value=str(self._cfg.get("phase2_poll_minutes", PHASE2_CARD_POLL_MIN))
@@ -1195,7 +1381,7 @@ class SettingsDialog(tk.Toplevel):
                                font=FONT, relief="flat", insertbackground=FG, width=6)
         poll_entry.pack(side="left")
         bind_word_delete(poll_entry)
-        tk.Label(poll_row, text="minutes  (Phase 2, requires session cookies)",
+        tk.Label(poll_row, text="minutes  (solo and multi_then_solo modes, requires session cookies)",
                  bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
 
         # Merge refresh buttons
@@ -1205,7 +1391,7 @@ class SettingsDialog(tk.Toplevel):
             text='Merge "Refresh Drops" and "Refresh Playtimes" into a single "Refresh" button',
             variable=self._merge_refresh_var,
             bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=16, column=0, columnspan=2, padx=16, pady=(2, 2), sticky="w")
+        ).grid(row=18, column=0, columnspan=2, padx=16, pady=(2, 2), sticky="w")
 
         # Auto-remove completed
         self._auto_remove_var = tk.BooleanVar(value=self._cfg.get("auto_remove_completed", False))
@@ -1214,16 +1400,23 @@ class SettingsDialog(tk.Toplevel):
             text="Automatically remove a game from the list once all its cards are dropped",
             variable=self._auto_remove_var,
             bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=17, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
+        ).grid(row=19, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
 
         bf = tk.Frame(self, bg=BG)
-        bf.grid(row=18, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
+        bf.grid(row=20, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
         tk.Button(bf, text="Save",   bg=ACCENT, fg="#fff", font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self._save
                   ).pack(side="right", padx=(6, 0))
         tk.Button(bf, text="Cancel", bg=BTN_BG, fg=FG,    font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self.destroy
                   ).pack(side="right")
+
+    def _on_mode_change(self):
+        mode = self._mode_var.get()
+        if mode in ("multi_then_solo", "fast_cycle"):
+            self._thresh_frame.grid()
+        else:
+            self._thresh_frame.grid_remove()
 
     def _lookup_steam_id(self):
         key = self._api_key_var.get().strip()
@@ -1261,6 +1454,7 @@ class SettingsDialog(tk.Toplevel):
             "session_id":              self._session_var.get().strip(),
             "login_secure":            self._login_var.get().strip(),
             "playtime_unit":           self._unit_var.get(),
+            "idle_mode":               self._mode_var.get(),
             "phase1_threshold_hours":  thresh,
             "phase2_poll_minutes":     poll_minutes,
             "merge_refresh_buttons":   self._merge_refresh_var.get(),
@@ -1660,9 +1854,9 @@ class SummaryBar(tk.Frame):
 
     def _build(self):
         self._total_drops = self._stat(0, "Total drops left")
-        self._total_pt    = self._stat(1, "Phase 1 time left")
-        self._games_p1    = self._stat(2, "In phase 1")
-        self._games_p2    = self._stat(3, "In phase 2")
+        self._total_pt    = self._stat(1, "Multi-idle time left")
+        self._games_p1    = self._stat(2, "Not yet solo-ready")
+        self._games_p2    = self._stat(3, "Solo queue")
         self._games_done  = self._stat(4, "Done")
 
     def refresh(self, games: list, unit: str = "minutes", threshold_h: float = 0.0, phase1_remaining_sec: float | None = None):
@@ -2320,9 +2514,38 @@ class App(tk.Tk):
 
         self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
 
-    # -----------------------------------------------------------------------
-    # Inline cell editing
-    # -----------------------------------------------------------------------
+        # Auto-remove sweep: catches manual toggles, bulk edits, startup, etc.
+        # The Phase 2 loop has its own call to on_auto_remove for the active
+        # game; this handles everything else.
+        if self.config.get("auto_remove_completed", False):
+            to_remove = {g["app_id"] for g in self.games if g["cards_done"]}
+            if to_remove:
+                self.games[:] = [g for g in self.games if g["app_id"] not in to_remove]
+                save_games(self.games)
+                for app_id in to_remove:
+                    self._append_log(f"Auto-removed {app_id} (cards done).")
+                # Redraw without removed games. Can't call _refresh_table again
+                # (recursion) so rebuild the treeview rows directly here.
+                self._tree.delete(*self._tree.get_children())
+                for display_pos, (orig_idx, g) in enumerate(self._sorted_games_for_display()):
+                    if search_norm:
+                        name_norm = self._filter_normalize(g["name"])
+                        if search_norm not in name_norm and search_norm not in g["app_id"]:
+                            continue
+                    tag = "active" if g["phase1_done"] else ("even" if display_pos % 2 == 0 else "odd")
+                    drops_str = str(g["cards_remaining"]) if g["cards_remaining"] >= 0 else "?"
+                    self._tree.insert("", "end", iid=str(orig_idx),
+                        values=(
+                            orig_idx + 1,
+                            g["app_id"],
+                            g["name"],
+                            self._playtime_display(g["playtime_hours"]),
+                            drops_str,
+                            "yes" if g["phase1_done"] else "no",
+                            "yes" if g["cards_done"]  else "no",
+                        ),
+                        tags=(tag,))
+                self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
 
     _EDITABLE = {
         "order":    "order",
