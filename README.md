@@ -80,8 +80,10 @@ The API key and `steamLoginSecure` fields have a **Hide** checkbox (on by defaul
 **Display and behaviour**
 - **Playtime unit** - minutes (default), hours, seconds, or days. Takes effect immediately everywhere.
 - **Idle mode** - see Idle modes above. Each option has a description in the Settings window.
-- **Switch to solo after** - only shown for "multi then solo" and "fast cycle" modes. For multi then solo this is hours of playtime per game before switching. For fast cycle this is minutes per cycle before stopping and restarting each game.
-- **Check for drops every** - minutes between automatic drop checks in solo and multi then solo modes. Default 5. Requires session cookies.
+- **Switch to solo after** - shown for "multi then solo" only. Hours of playtime per game before switching to solo. Set to 0 to wait indefinitely.
+- **Check for drops every** - shown for "solo" and "multi then solo". Time between automatic drop checks. Default 5 minutes. Requires session cookies.
+- **Multi-idle for** - shown for "fast cycle" only. How long to run all games simultaneously before cycling through each one to collect drops.
+- **Pause after stopping each game for** - shown for "fast cycle" only. How long to wait after stopping each game before checking drops and restarting it. Default 5 seconds. Lower values may cause Steam to not register the session end in time.
 - **Merge Refresh buttons** - combine Refresh Drops and Refresh Playtimes into a single Refresh button.
 - **Auto-remove completed** - automatically remove a game from the list once all its cards are dropped.
 
@@ -124,7 +126,7 @@ Double-click any cell to edit inline. Click elsewhere, Enter, or Escape to commi
 | Name | Edit the game name |
 | Playtime | Type a new value in the current unit |
 | Drops left | Type a number; setting it to 0 also marks cards done |
-| Solo ready | Double-click to toggle yes/no - whether this game is queued for solo mode |
+| Solo ready | Double-click to toggle yes/no - only relevant in "multi then solo" mode, ignored in all other modes |
 | Cards done | Double-click to toggle yes/no |
 
 ### Multi-select editing
@@ -158,6 +160,8 @@ Sorting by any column other than `#` is view-only and does not affect idle order
 
 The status panel shows the current mode and game being idled, how long it has been running, and when the next drop check fires.
 
+The summary bar above the table shows stats relevant to the current idle mode. In multi then solo mode it shows total drops left, multi-idle time remaining, how many games are not yet solo-ready, solo queue size, and done count. In multi or fast cycle mode the solo-ready columns are hidden since they don't apply. In solo mode only total drops left and done are shown.
+
 The log records every event with a full timestamp. You can select and copy text in it directly. Buttons next to the Log label:
 - **Copy Log** - copies the entire log to the clipboard
 - **Export Log** - saves to `logs/log-YYYY-MM-DD_HH-MM-SS-mmm.txt`
@@ -183,7 +187,7 @@ The log records every event with a full timestamp. You can select and copy text 
 |---|---|
 | **Remove Completed** | Remove all games marked cards done (asks for confirmation) |
 | **Remove All** | Remove every game (asks for confirmation, undoable with Ctrl+Z) |
-| **Full Reset** | Remove every game and wipe all settings including API key and cookies (asks for confirmation) |
+| **Full Reset** | Remove every game and wipe all settings including API key and cookies. Cannot be undone. |
 | **Force Kill All SAM** | Kills every SAM.Game.exe process immediately |
 
 **Right block**
