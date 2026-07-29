@@ -126,10 +126,11 @@ _DEFAULT_CONFIG = {
     "hide_api_key": True,
     "hide_login_secure": True,
     "idle_mode": "multi",
-    "phase1_threshold_hours": 0.0,
+    "phase1_threshold_seconds": 7200.0,   # 2 hours default
+    "phase2_poll_seconds": 300.0,         # 5 minutes default
+    "fast_cycle_seconds": 1800.0,         # 30 minutes default
     "merge_refresh_buttons": False,
     "auto_remove_completed": False,
-    "phase2_poll_minutes": 5.0,
 }
 
 
@@ -153,6 +154,7 @@ def load_config() -> tuple[dict, str | None]:
                 raise ValueError("config file did not contain a JSON object")
             cfg = dict(_DEFAULT_CONFIG)
             cfg.update(loaded)
+            _migrate_config(cfg)
             return cfg, None
         except Exception as exc:
             backup = _backup_corrupt_file(CONFIG_FILE)
@@ -167,6 +169,16 @@ def load_config() -> tuple[dict, str | None]:
 def save_config(cfg: dict) -> None:
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+
+def _migrate_config(cfg: dict) -> None:
+    """Convert old per-unit config keys to the unified *_seconds keys in place."""
+    if "phase1_threshold_hours" in cfg and "phase1_threshold_seconds" not in cfg:
+        cfg["phase1_threshold_seconds"] = float(cfg.pop("phase1_threshold_hours")) * 3600
+    if "phase2_poll_minutes" in cfg and "phase2_poll_seconds" not in cfg:
+        cfg["phase2_poll_seconds"] = float(cfg.pop("phase2_poll_minutes")) * 60
+    if "fast_cycle_minutes" in cfg and "fast_cycle_seconds" not in cfg:
+        cfg["fast_cycle_seconds"] = float(cfg.pop("fast_cycle_minutes")) * 60
 
 
 def _sanitize_game(entry) -> dict | None:
@@ -668,7 +680,7 @@ class IdleController:
     # Phase 1 ---------------------------------------------------------------
 
     def _run_phase1(self):
-        threshold_h = float(self.config.get("phase1_threshold_hours", 0.0))
+        threshold_h = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
         infinite    = threshold_h <= 0.0
 
         if infinite:
@@ -848,7 +860,7 @@ class IdleController:
 
             game_start        = time.time()
             last_poll         = time.time()
-            poll_sec          = max(1.0, float(self.config.get("phase2_poll_minutes", PHASE2_CARD_POLL_MIN))) * 60
+            poll_sec          = max(1.0, float(self.config.get("phase2_poll_seconds", PHASE2_CARD_POLL_MIN * 60)))
             paused_secs       = 0.0   # total crash time since game_start, for elapsed_sec
             paused_since_poll = 0.0   # crash time since last_poll, for the poll countdown
             crash_since  = None
@@ -965,8 +977,8 @@ class IdleController:
             self._log("Fast cycle: no games need cards.")
             return
 
-        cycle_minutes = float(self.config.get("phase1_threshold_hours", 0.5)) or 0.5
-        poll_sec      = max(1.0, float(self.config.get("phase2_poll_minutes", PHASE2_CARD_POLL_MIN))) * 60
+        cycle_minutes = float(self.config.get("fast_cycle_seconds", 1800.0)) / 60
+        poll_sec      = max(1.0, float(self.config.get("phase2_poll_seconds", PHASE2_CARD_POLL_MIN * 60)))
 
         self._log(
             f"Fast cycle: {len(targets)} game(s). "
@@ -1166,6 +1178,25 @@ def bind_word_delete(entry: tk.Entry) -> None:
 # Settings dialog
 # ---------------------------------------------------------------------------
 
+def _sec_to_display(seconds: float) -> tuple[str, int | float]:
+    """Pick the most readable unit for a seconds value and return (unit, value)."""
+    if seconds < 60:
+        return "seconds", int(seconds)
+    if seconds < 3600:
+        val = seconds / 60
+        return "minutes", int(val) if val == int(val) else round(val, 1)
+    val = seconds / 3600
+    return "hours", int(val) if val == int(val) else round(val, 1)
+
+
+def _display_to_sec(val_str: str, unit: str) -> float:
+    multipliers = {"seconds": 1.0, "minutes": 60.0, "hours": 3600.0}
+    try:
+        return max(0.0, float(val_str.strip().replace(",", ".")) * multipliers.get(unit, 60.0))
+    except ValueError:
+        return multipliers.get(unit, 60.0)  # default to 1 unit
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, config: dict, unit_var: tk.StringVar):
         super().__init__(parent)
@@ -1354,35 +1385,53 @@ class SettingsDialog(tk.Toplevel):
             tk.Label(rb_frame, text=desc, bg=BG, fg=GREY, font=SMALL,
                      justify="left").pack(anchor="w", padx=(22, 0))
 
-        # Threshold row (only relevant for multi_then_solo and fast_cycle)
+        # Per-mode option rows, shown/hidden based on selected mode
+        # --- multi_then_solo: playtime threshold ---
         self._thresh_frame = tk.Frame(self, bg=BG)
-        self._thresh_frame.grid(row=16, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
-        tk.Label(self._thresh_frame, text="Switch to solo after:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
-        self._thresh_var = tk.StringVar(
-            value=str(self._cfg.get("phase1_threshold_hours", 0.0))
-        )
-        thresh_entry = tk.Entry(self._thresh_frame, textvariable=self._thresh_var, bg=ENTRY_BG, fg=FG,
-                                 font=FONT, relief="flat", insertbackground=FG, width=6)
-        thresh_entry.pack(side="left")
-        bind_word_delete(thresh_entry)
-        tk.Label(self._thresh_frame,
-                 text="hours of playtime per game  (multi_then_solo) / minutes per cycle  (fast_cycle)",
-                 bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
-        self._on_mode_change()  # set initial visibility
+        self._thresh_frame.grid(row=16, column=0, columnspan=2, padx=36, pady=(0, 4), sticky="w")
+        tk.Label(self._thresh_frame, text="Switch to solo after", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        thresh_sec = float(self._cfg.get("phase1_threshold_seconds", 7200.0))
+        thresh_unit_default, thresh_val_default = _sec_to_display(thresh_sec)
+        self._thresh_val_var  = tk.StringVar(value=str(thresh_val_default))
+        self._thresh_unit_var = tk.StringVar(value=thresh_unit_default)
+        tk.Entry(self._thresh_frame, textvariable=self._thresh_val_var, bg=ENTRY_BG, fg=FG,
+                 font=FONT, relief="flat", insertbackground=FG, width=6).pack(side="left")
+        ttk.Combobox(self._thresh_frame, textvariable=self._thresh_unit_var,
+                     values=["seconds", "minutes", "hours"], state="readonly",
+                     width=8, font=FONT).pack(side="left", padx=(4, 0))
+        tk.Label(self._thresh_frame, text="per game", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
 
-        # Phase 2 drop-check interval
-        poll_row = tk.Frame(self, bg=BG)
-        poll_row.grid(row=17, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
-        tk.Label(poll_row, text="Check for drops every:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
-        self._poll_var = tk.StringVar(
-            value=str(self._cfg.get("phase2_poll_minutes", PHASE2_CARD_POLL_MIN))
-        )
-        poll_entry = tk.Entry(poll_row, textvariable=self._poll_var, bg=ENTRY_BG, fg=FG,
-                               font=FONT, relief="flat", insertbackground=FG, width=6)
-        poll_entry.pack(side="left")
-        bind_word_delete(poll_entry)
-        tk.Label(poll_row, text="minutes  (solo and multi_then_solo modes, requires session cookies)",
-                 bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+        # --- solo + multi_then_solo: drop check interval ---
+        self._poll_frame = tk.Frame(self, bg=BG)
+        self._poll_frame.grid(row=17, column=0, columnspan=2, padx=36, pady=(0, 4), sticky="w")
+        tk.Label(self._poll_frame, text="Check for drops every", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        poll_sec = float(self._cfg.get("phase2_poll_seconds", 300.0))
+        poll_unit_default, poll_val_default = _sec_to_display(poll_sec)
+        self._poll_val_var  = tk.StringVar(value=str(poll_val_default))
+        self._poll_unit_var = tk.StringVar(value=poll_unit_default)
+        tk.Entry(self._poll_frame, textvariable=self._poll_val_var, bg=ENTRY_BG, fg=FG,
+                 font=FONT, relief="flat", insertbackground=FG, width=6).pack(side="left")
+        ttk.Combobox(self._poll_frame, textvariable=self._poll_unit_var,
+                     values=["seconds", "minutes", "hours"], state="readonly",
+                     width=8, font=FONT).pack(side="left", padx=(4, 0))
+        tk.Label(self._poll_frame, text="(requires session cookies)", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+
+        # --- fast_cycle: cycle duration ---
+        self._cycle_frame = tk.Frame(self, bg=BG)
+        self._cycle_frame.grid(row=18, column=0, columnspan=2, padx=36, pady=(0, 4), sticky="w")
+        tk.Label(self._cycle_frame, text="Multi-idle for", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        cycle_sec = float(self._cfg.get("fast_cycle_seconds", 1800.0))
+        cycle_unit_default, cycle_val_default = _sec_to_display(cycle_sec)
+        self._cycle_val_var  = tk.StringVar(value=str(cycle_val_default))
+        self._cycle_unit_var = tk.StringVar(value=cycle_unit_default)
+        tk.Entry(self._cycle_frame, textvariable=self._cycle_val_var, bg=ENTRY_BG, fg=FG,
+                 font=FONT, relief="flat", insertbackground=FG, width=6).pack(side="left")
+        ttk.Combobox(self._cycle_frame, textvariable=self._cycle_unit_var,
+                     values=["seconds", "minutes", "hours"], state="readonly",
+                     width=8, font=FONT).pack(side="left", padx=(4, 0))
+        tk.Label(self._cycle_frame, text="per cycle before collecting drops", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+
+        self._on_mode_change()  # set initial visibility
 
         # Merge refresh buttons
         self._merge_refresh_var = tk.BooleanVar(value=self._cfg.get("merge_refresh_buttons", False))
@@ -1391,7 +1440,7 @@ class SettingsDialog(tk.Toplevel):
             text='Merge "Refresh Drops" and "Refresh Playtimes" into a single "Refresh" button',
             variable=self._merge_refresh_var,
             bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=18, column=0, columnspan=2, padx=16, pady=(2, 2), sticky="w")
+        ).grid(row=19, column=0, columnspan=2, padx=16, pady=(8, 2), sticky="w")
 
         # Auto-remove completed
         self._auto_remove_var = tk.BooleanVar(value=self._cfg.get("auto_remove_completed", False))
@@ -1400,10 +1449,10 @@ class SettingsDialog(tk.Toplevel):
             text="Automatically remove a game from the list once all its cards are dropped",
             variable=self._auto_remove_var,
             bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=19, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
+        ).grid(row=20, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
 
         bf = tk.Frame(self, bg=BG)
-        bf.grid(row=20, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
+        bf.grid(row=21, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
         tk.Button(bf, text="Save",   bg=ACCENT, fg="#fff", font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self._save
                   ).pack(side="right", padx=(6, 0))
@@ -1413,10 +1462,21 @@ class SettingsDialog(tk.Toplevel):
 
     def _on_mode_change(self):
         mode = self._mode_var.get()
-        if mode in ("multi_then_solo", "fast_cycle"):
+        # thresh: only multi_then_solo
+        if mode == "multi_then_solo":
             self._thresh_frame.grid()
         else:
             self._thresh_frame.grid_remove()
+        # poll: solo and multi_then_solo
+        if mode in ("solo", "multi_then_solo"):
+            self._poll_frame.grid()
+        else:
+            self._poll_frame.grid_remove()
+        # cycle duration: only fast_cycle
+        if mode == "fast_cycle":
+            self._cycle_frame.grid()
+        else:
+            self._cycle_frame.grid_remove()
 
     def _lookup_steam_id(self):
         key = self._api_key_var.get().strip()
@@ -1436,31 +1496,23 @@ class SettingsDialog(tk.Toplevel):
         messagebox.showinfo("Found it", f"Resolved to Steam ID: {resolved}")
 
     def _save(self):
-        try:
-            thresh = float(self._thresh_var.get().strip().replace(",", "."))
-            if thresh < 0:
-                thresh = 0.0
-        except ValueError:
-            thresh = 0.0
-        try:
-            poll_minutes = float(self._poll_var.get().strip().replace(",", "."))
-            if poll_minutes <= 0:
-                raise ValueError
-        except ValueError:
-            poll_minutes = PHASE2_CARD_POLL_MIN
+        thresh_sec = _display_to_sec(self._thresh_val_var.get(), self._thresh_unit_var.get())
+        poll_sec   = max(1.0, _display_to_sec(self._poll_val_var.get(), self._poll_unit_var.get()))
+        cycle_sec  = max(1.0, _display_to_sec(self._cycle_val_var.get(), self._cycle_unit_var.get()))
         self.result = {
-            "api_key":                 self._api_key_var.get().strip(),
-            "steam_id":                self._steam_id_var.get().strip(),
-            "session_id":              self._session_var.get().strip(),
-            "login_secure":            self._login_var.get().strip(),
-            "playtime_unit":           self._unit_var.get(),
-            "idle_mode":               self._mode_var.get(),
-            "phase1_threshold_hours":  thresh,
-            "phase2_poll_minutes":     poll_minutes,
-            "merge_refresh_buttons":   self._merge_refresh_var.get(),
-            "auto_remove_completed":   self._auto_remove_var.get(),
-            "hide_api_key":            self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
-            "hide_login_secure":       self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
+            "api_key":                  self._api_key_var.get().strip(),
+            "steam_id":                 self._steam_id_var.get().strip(),
+            "session_id":               self._session_var.get().strip(),
+            "login_secure":             self._login_var.get().strip(),
+            "playtime_unit":            self._unit_var.get(),
+            "idle_mode":                self._mode_var.get(),
+            "phase1_threshold_seconds": thresh_sec,
+            "phase2_poll_seconds":      poll_sec,
+            "fast_cycle_seconds":       cycle_sec,
+            "merge_refresh_buttons":    self._merge_refresh_var.get(),
+            "auto_remove_completed":    self._auto_remove_var.get(),
+            "hide_api_key":             self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
+            "hide_login_secure":        self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
         }
         self.destroy()
 
@@ -1993,7 +2045,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._refresh_table()
-        self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
+        self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600))
 
         # Clicking on empty space unfocuses any active entry/cell editor
         self.bind("<Button-1>", self._maybe_unfocus_on_click)
@@ -2070,12 +2122,13 @@ class App(tk.Tk):
 
         tb_right = tk.Frame(tb_wrap, bg=BG)
         self._refresh_drops_btn = self._mk_btn(tb_right, "Refresh Drops", self._refresh_drops)
-        self._refresh_drops_btn.pack(side="left", padx=(0, 6))
-        self._refresh_pt_btn = self._mk_btn(tb_right, "Refresh Playtimes", self._refresh_playtimes)
-        self._refresh_pt_btn.pack(side="left", padx=(0, 6))
-        # Keep _refresh_btn pointing to drops button for compat with existing state changes
+        self._refresh_pt_btn    = self._mk_btn(tb_right, "Refresh Playtimes", self._refresh_playtimes)
+        self._settings_btn      = self._mk_btn(tb_right, "Settings", self._open_settings)
         self._refresh_btn = self._refresh_drops_btn
-        self._mk_btn(tb_right, "Settings", self._open_settings).pack(side="left")
+        # Initial pack order: Refresh Drops, Refresh Playtimes, Settings
+        self._refresh_drops_btn.pack(side="left", padx=(0, 6))
+        self._refresh_pt_btn.pack(side="left", padx=(0, 6))
+        self._settings_btn.pack(side="left")
 
         tb_wrap.set_children(tb_left, tb_right)
         # Apply merge/split mode from config
@@ -2374,7 +2427,7 @@ class App(tk.Tk):
         self.config["playtime_unit"] = self._unit
         save_config(self.config)
         self._refresh_table()
-        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
+        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600))
 
     # -----------------------------------------------------------------------
     # Table
@@ -2512,7 +2565,7 @@ class App(tk.Tk):
             else:
                 self._search_count_lbl.config(text="")
 
-        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
+        self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600))
 
         # Auto-remove sweep: catches manual toggles, bulk edits, startup, etc.
         # The Phase 2 loop has its own call to on_auto_remove for the active
@@ -2545,7 +2598,7 @@ class App(tk.Tk):
                             "yes" if g["cards_done"]  else "no",
                         ),
                         tags=(tag,))
-                self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)))
+                self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600))
 
     _EDITABLE = {
         "order":    "order",
@@ -2625,7 +2678,7 @@ class App(tk.Tk):
             hours = parse_playtime(raw, self._unit)
             for idx in indices:
                 self.games[idx]["playtime_hours"] = hours
-                self.games[idx]["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 0.0))
+                self.games[idx]["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
         elif edit_type == "drops":
             raw = simpledialog.askstring(
                 "Bulk Edit", f"Set drops remaining for {len(indices)} game(s):", parent=self
@@ -2702,7 +2755,7 @@ class App(tk.Tk):
             self._push_undo()
             hours = parse_playtime(raw_val, self._unit)
             g["playtime_hours"] = hours
-            g["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_hours", 0.0))
+            g["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
             save_games(self.games)
             self._refresh_table()
             return
@@ -2768,7 +2821,7 @@ class App(tk.Tk):
             menu.add_separator()
 
         # Toggle flags (works for single and multi)
-        thresh = float(self.config.get("phase1_threshold_hours", 0.0))
+        thresh = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
         label_2h = f"Mark {len(selected)} game(s) Phase 2 ready" if multi else (
             "Mark Phase 2 ready" if not g["phase1_done"] else "Mark Phase 2 NOT ready"
         )
@@ -2986,7 +3039,7 @@ class App(tk.Tk):
             if self._running and st.phase1_running:
                 self._summary.refresh(
                     self.games, self._unit,
-                    threshold_h=float(self.config.get("phase1_threshold_hours", 0.0)),
+                    threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600),
                     phase1_remaining_sec=st.next_check_sec,
                 )
         self._dispatch(_apply)
@@ -3008,13 +3061,19 @@ class App(tk.Tk):
     # -----------------------------------------------------------------------
 
     def _apply_refresh_button_mode(self):
+        # Unpack all three, then re-pack in the correct order so there is
+        # never a chance of Settings ending up between the refresh buttons.
+        self._refresh_drops_btn.pack_forget()
+        self._refresh_pt_btn.pack_forget()
+        self._settings_btn.pack_forget()
         if self.config.get("merge_refresh_buttons", False):
             self._refresh_drops_btn.config(text="Refresh", command=self._refresh_all)
-            self._refresh_pt_btn.pack_forget()
+            self._refresh_drops_btn.pack(side="left", padx=(0, 6))
         else:
             self._refresh_drops_btn.config(text="Refresh Drops", command=self._refresh_drops)
-            if not self._refresh_pt_btn.winfo_ismapped():
-                self._refresh_pt_btn.pack(side="left", padx=(0, 6))
+            self._refresh_drops_btn.pack(side="left", padx=(0, 6))
+            self._refresh_pt_btn.pack(side="left", padx=(0, 6))
+        self._settings_btn.pack(side="left")
 
     def _refresh_all(self, silent: bool = False):
         self._refresh_drops(silent=silent)
@@ -3167,7 +3226,7 @@ class App(tk.Tk):
             return   # user cancelled
 
         hours = parse_playtime(pt, self._unit)
-        thresh = float(self.config.get("phase1_threshold_hours", 0.0))
+        thresh = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
         self._push_undo()
         game = default_game(app_id, name or "", hours)
         game["phase1_done"] = hours >= thresh
@@ -3226,28 +3285,32 @@ class App(tk.Tk):
     def _full_reset(self):
         if not messagebox.askyesno(
             "Full Reset",
-            "This will remove all games AND wipe all settings (API key, cookies, preferences).\n\n"
-            "Everything goes back to factory defaults. Are you sure?",
+            "This will delete all games, all settings (API key, cookies, preferences), "
+            "and the entire undo history.\n\n"
+            "The app will be in the same state as a fresh launch. This cannot be undone. Are you sure?",
         ):
             return
-        self._push_undo()
-        count = len(self.games)
+        # Wipe everything in memory
         self.games.clear()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
         self._last_removed = None
         self._undo_btn.config(state="disabled")
-        save_games(self.games)
-        try:
-            if CONFIG_FILE.exists():
-                CONFIG_FILE.unlink()
-        except Exception:
-            pass
+        # Wipe both data files from disk
+        for path in (DATA_FILE, CONFIG_FILE):
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+        # Reset config to defaults
         self.config.clear()
         self.config.update(dict(_DEFAULT_CONFIG))
         self._unit_var.set(self.config.get("playtime_unit", "minutes"))
         self._apply_refresh_button_mode()
         self._update_cards_hint()
         self._refresh_table()
-        self._append_log(f"Full reset: removed {count} game(s) and cleared all settings.")
+        self._append_log("Full reset: all data and settings cleared.")
 
     # -----------------------------------------------------------------------
     # Refresh drops
@@ -3344,7 +3407,7 @@ class App(tk.Tk):
                 if not targets:
                     return
                 t = targets[0]
-                thresh = float(self.config.get("phase1_threshold_hours", 0.0))
+                thresh = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
                 msgs = []
                 if new_pt is not None:
                     t["playtime_hours"] = new_pt
@@ -3376,7 +3439,7 @@ class App(tk.Tk):
         self._append_log(f"Refreshing playtimes for {len(self.games)} game(s)...")
         api_key  = self.config["api_key"]
         steam_id = self.config["steam_id"]
-        thresh   = float(self.config.get("phase1_threshold_hours", 0.0))
+        thresh   = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
 
         def _fetch():
             try:
