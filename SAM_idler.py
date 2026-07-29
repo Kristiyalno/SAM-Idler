@@ -129,6 +129,7 @@ _DEFAULT_CONFIG = {
     "phase1_threshold_seconds": 7200.0,   # 2 hours default
     "phase2_poll_seconds": 300.0,         # 5 minutes default
     "fast_cycle_seconds": 1800.0,         # 30 minutes default
+    "fast_cycle_stop_pause_seconds": 5.0, # pause after stopping each game
     "merge_refresh_buttons": False,
     "auto_remove_completed": False,
 }
@@ -1032,7 +1033,8 @@ class IdleController:
                 self._emit()
 
                 self._stop_idle(app_id)
-                self._stop.wait(2)   # brief pause so Steam registers the session end
+                stop_pause = float(self.config.get("fast_cycle_stop_pause_seconds", 5.0))
+                self._stop.wait(stop_pause)
                 if self._stop.is_set():
                     return
 
@@ -1431,6 +1433,21 @@ class SettingsDialog(tk.Toplevel):
                      width=8, font=FONT).pack(side="left", padx=(4, 0))
         tk.Label(self._cycle_frame, text="per cycle before collecting drops", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
 
+        self._pause_frame = tk.Frame(self, bg=BG)
+        self._pause_frame.grid(row=19, column=0, columnspan=2, padx=36, pady=(0, 4), sticky="w")
+        tk.Label(self._pause_frame, text="Pause after stopping each game for", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        pause_sec = float(self._cfg.get("fast_cycle_stop_pause_seconds", 5.0))
+        pause_unit_default, pause_val_default = _sec_to_display(pause_sec)
+        self._pause_val_var  = tk.StringVar(value=str(pause_val_default))
+        self._pause_unit_var = tk.StringVar(value=pause_unit_default)
+        tk.Entry(self._pause_frame, textvariable=self._pause_val_var, bg=ENTRY_BG, fg=FG,
+                 font=FONT, relief="flat", insertbackground=FG, width=6).pack(side="left")
+        ttk.Combobox(self._pause_frame, textvariable=self._pause_unit_var,
+                     values=["seconds", "minutes"], state="readonly",
+                     width=8, font=FONT).pack(side="left", padx=(4, 0))
+        tk.Label(self._pause_frame, text="so Steam registers the session end",
+                 bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+
         self._on_mode_change()  # set initial visibility
 
         # Merge refresh buttons
@@ -1440,7 +1457,7 @@ class SettingsDialog(tk.Toplevel):
             text='Merge "Refresh Drops" and "Refresh Playtimes" into a single "Refresh" button',
             variable=self._merge_refresh_var,
             bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=19, column=0, columnspan=2, padx=16, pady=(8, 2), sticky="w")
+        ).grid(row=20, column=0, columnspan=2, padx=16, pady=(8, 2), sticky="w")
 
         # Auto-remove completed
         self._auto_remove_var = tk.BooleanVar(value=self._cfg.get("auto_remove_completed", False))
@@ -1449,10 +1466,10 @@ class SettingsDialog(tk.Toplevel):
             text="Automatically remove a game from the list once all its cards are dropped",
             variable=self._auto_remove_var,
             bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=20, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
+        ).grid(row=21, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
 
         bf = tk.Frame(self, bg=BG)
-        bf.grid(row=21, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
+        bf.grid(row=22, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
         tk.Button(bf, text="Save",   bg=ACCENT, fg="#fff", font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self._save
                   ).pack(side="right", padx=(6, 0))
@@ -1472,11 +1489,13 @@ class SettingsDialog(tk.Toplevel):
             self._poll_frame.grid()
         else:
             self._poll_frame.grid_remove()
-        # cycle duration: only fast_cycle
+        # cycle duration + stop pause: only fast_cycle
         if mode == "fast_cycle":
             self._cycle_frame.grid()
+            self._pause_frame.grid()
         else:
             self._cycle_frame.grid_remove()
+            self._pause_frame.grid_remove()
 
     def _lookup_steam_id(self):
         key = self._api_key_var.get().strip()
@@ -1499,20 +1518,22 @@ class SettingsDialog(tk.Toplevel):
         thresh_sec = _display_to_sec(self._thresh_val_var.get(), self._thresh_unit_var.get())
         poll_sec   = max(1.0, _display_to_sec(self._poll_val_var.get(), self._poll_unit_var.get()))
         cycle_sec  = max(1.0, _display_to_sec(self._cycle_val_var.get(), self._cycle_unit_var.get()))
+        pause_sec  = max(0.5, _display_to_sec(self._pause_val_var.get(), self._pause_unit_var.get()))
         self.result = {
-            "api_key":                  self._api_key_var.get().strip(),
-            "steam_id":                 self._steam_id_var.get().strip(),
-            "session_id":               self._session_var.get().strip(),
-            "login_secure":             self._login_var.get().strip(),
-            "playtime_unit":            self._unit_var.get(),
-            "idle_mode":                self._mode_var.get(),
-            "phase1_threshold_seconds": thresh_sec,
-            "phase2_poll_seconds":      poll_sec,
-            "fast_cycle_seconds":       cycle_sec,
-            "merge_refresh_buttons":    self._merge_refresh_var.get(),
-            "auto_remove_completed":    self._auto_remove_var.get(),
-            "hide_api_key":             self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
-            "hide_login_secure":        self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
+            "api_key":                       self._api_key_var.get().strip(),
+            "steam_id":                      self._steam_id_var.get().strip(),
+            "session_id":                    self._session_var.get().strip(),
+            "login_secure":                  self._login_var.get().strip(),
+            "playtime_unit":                 self._unit_var.get(),
+            "idle_mode":                     self._mode_var.get(),
+            "phase1_threshold_seconds":      thresh_sec,
+            "phase2_poll_seconds":           poll_sec,
+            "fast_cycle_seconds":            cycle_sec,
+            "fast_cycle_stop_pause_seconds": pause_sec,
+            "merge_refresh_buttons":         self._merge_refresh_var.get(),
+            "auto_remove_completed":         self._auto_remove_var.get(),
+            "hide_api_key":                  self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
+            "hide_login_secure":             self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
         }
         self.destroy()
 
