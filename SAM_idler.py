@@ -1217,288 +1217,222 @@ class SettingsDialog(tk.Toplevel):
         self.transient(parent)
         self.wait_window()
 
-    def _field(self, label, key, row, hideable: str | None = None, extra_btn=None):
-        """
-        hideable: config key for the hide boolean (e.g. 'hide_api_key').
-                  If given, a Hide checkbox is appended and the entry toggles show='*'.
-        """
-        tk.Label(self, text=label, bg=BG, fg=FG, font=FONT, anchor="w").grid(
-            row=row, column=0, sticky="w", padx=(16, 8), pady=6
-        )
-        var = tk.StringVar(value=self._cfg.get(key, ""))
-        entry_frame = tk.Frame(self, bg=BG)
-        entry_frame.grid(row=row, column=1, padx=(0, 16), pady=6, sticky="w")
-
-        initial_show = "*" if (hideable and self._cfg.get(hideable, True)) else ""
-        entry = tk.Entry(
-            entry_frame, textvariable=var, bg=ENTRY_BG, fg=FG, font=FONT,
-            relief="flat", insertbackground=FG, width=30,
-            show=initial_show,
-            # Allow normal clipboard shortcuts
-            exportselection=True,
-        )
-        entry.pack(side="left")
-
-        # Right-click context menu for copy/cut/paste/select all
-        def _make_menu(e):
-            m = tk.Menu(entry, tearoff=0, bg=BTN_BG, fg=FG,
-                        activebackground=ACCENT, activeforeground="#fff",
-                        relief="flat", bd=0)
-            m.add_command(label="Cut",        command=lambda: entry.event_generate("<<Cut>>"))
-            m.add_command(label="Copy",       command=lambda: entry.event_generate("<<Copy>>"))
-            m.add_command(label="Paste",      command=lambda: entry.event_generate("<<Paste>>"))
-            m.add_separator()
-            m.add_command(label="Select All", command=lambda: (entry.select_range(0, "end"), entry.focus_set()))
-            m.post(e.x_root, e.y_root)
-        entry.bind("<Button-3>", _make_menu)
-        # Ctrl+A to select all
-        entry.bind("<Control-a>", lambda e: (entry.select_range(0, "end"), "break"))
-        entry.bind("<Control-A>", lambda e: (entry.select_range(0, "end"), "break"))
-        # Unfocus on Escape
-        entry.bind("<Escape>", lambda e: self.focus_set())
-        bind_word_delete(entry)
-
-        if hideable:
-            hide_var = tk.BooleanVar(value=self._cfg.get(hideable, True))
-            self._hide_vars[hideable] = hide_var
-
-            def _toggle_show(*_):
-                entry.config(show="*" if hide_var.get() else "")
-
-            hide_var.trace_add("write", _toggle_show)
-            tk.Checkbutton(
-                entry_frame, text="Hide", variable=hide_var,
-                bg=BG, fg=GREY, selectcolor=BTN_BG,
-                activebackground=BG, font=SMALL,
-            ).pack(side="left", padx=(8, 0))
-
-        if extra_btn:
-            text, cmd = extra_btn
-            tk.Button(entry_frame, text=text, bg=BTN_BG, fg=FG, font=SMALL,
-                      relief="flat", padx=6, pady=3, cursor="hand2", bd=0,
-                      command=cmd).pack(side="left", padx=(6, 0))
-        return var
-
-    def _link(self, parent, text, url, **grid_kw):
-        lbl = tk.Label(parent, text=text, bg=BG, fg=ACCENT, font=SMALL,
-                        cursor="hand2", anchor="w")
-        lbl.grid(**grid_kw)
-        lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
-        return lbl
-
     def _build(self):
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=1)
+
+        # ── Title ────────────────────────────────────────────────────────────
         tk.Label(self, text="Settings", font=TITLE, bg=BG, fg=ACCENT).grid(
-            row=0, column=0, columnspan=2, padx=16, pady=(14, 6), sticky="w"
+            row=0, column=0, columnspan=2, padx=16, pady=(14, 10), sticky="w"
         )
-        tk.Label(self, text="Steam Web API  (library import, playtime)",
-                 bg=BG, fg=GREY, font=SMALL).grid(
-            row=1, column=0, columnspan=2, padx=16, sticky="w")
-        self._api_key_var = self._field("API Key", "api_key", 2, hideable="hide_api_key")
-        self._link(self, "Get an API key",
-                    "https://steamcommunity.com/dev/apikey",
-                    row=3, column=0, columnspan=2, padx=16, sticky="w")
 
-        self._steam_id_var = self._field(
-            "Steam ID / vanity name", "steam_id", 4,
-            extra_btn=("Look up", self._lookup_steam_id),
-        )
-        tk.Label(self, text="Paste your 64-bit ID, your profile URL, or just your vanity name, then click Look up.",
-                 bg=BG, fg=GREY, font=SMALL, wraplength=420, justify="left").grid(
-            row=5, column=0, columnspan=2, padx=16, sticky="w")
+        # ── Left panel: credentials ──────────────────────────────────────────
+        left = tk.Frame(self, bg=BG)
+        left.grid(row=1, column=0, padx=(16, 8), pady=0, sticky="nwe")
 
-        tk.Label(self, text="Session cookies  (automatic card-drop detection, optional)",
-                 bg=BG, fg=GREY, font=SMALL).grid(
-            row=6, column=0, columnspan=2, padx=16, pady=(10, 0), sticky="w")
-        tk.Label(self,
-                 text="Log into steamcommunity.com in your browser first, then open the cookies page below,\n"
-                      "find 'sessionid' and 'steamLoginSecure', and copy each Value into the boxes here.",
-                 bg=BG, fg=GREY, font=SMALL, justify="left").grid(
-            row=7, column=0, columnspan=2, padx=16, sticky="w")
-        self._link(self, "Open steamcommunity.com cookies page",
-                    "https://steamcommunity.com/",
-                    row=8, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
-        self._session_var = self._field("sessionid",         "session_id",   9)
-        self._login_var   = self._field("steamLoginSecure",  "login_secure", 10, hideable="hide_login_secure")
-        tk.Label(self, text="Don't have these? Leave them blank — use \"Cards Dropped (manual)\" instead.",
-                 bg=BG, fg=GREY, font=SMALL).grid(
-            row=11, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
+        tk.Label(left, text="Steam Web API", bg=BG, fg=ACCENT, font=FONT).pack(anchor="w", pady=(0, 2))
+        tk.Label(left, text="Required for library import and playtime refresh.",
+                 bg=BG, fg=GREY, font=SMALL).pack(anchor="w")
 
-        # Display / behaviour options
-        tk.Label(self, text="Display & behaviour",
-                 bg=BG, fg=GREY, font=SMALL).grid(
-            row=12, column=0, columnspan=2, padx=16, pady=(12, 2), sticky="w")
+        def lfield(parent, label, key, hideable=None, extra_btn=None):
+            tk.Label(parent, text=label, bg=BG, fg=FG, font=FONT, anchor="w").pack(anchor="w", pady=(8, 1))
+            var = tk.StringVar(value=self._cfg.get(key, ""))
+            row_f = tk.Frame(parent, bg=BG)
+            row_f.pack(anchor="w", fill="x")
+            initial_show = "*" if (hideable and self._cfg.get(hideable, True)) else ""
+            entry = tk.Entry(row_f, textvariable=var, bg=ENTRY_BG, fg=FG, font=FONT,
+                             relief="flat", insertbackground=FG, width=28, show=initial_show,
+                             exportselection=True)
+            entry.pack(side="left")
+            def _make_menu(e):
+                m = tk.Menu(entry, tearoff=0, bg=BTN_BG, fg=FG,
+                            activebackground=ACCENT, activeforeground="#fff",
+                            relief="flat", bd=0)
+                m.add_command(label="Cut",        command=lambda: entry.event_generate("<<Cut>>"))
+                m.add_command(label="Copy",       command=lambda: entry.event_generate("<<Copy>>"))
+                m.add_command(label="Paste",      command=lambda: entry.event_generate("<<Paste>>"))
+                m.add_separator()
+                m.add_command(label="Select All", command=lambda: (entry.select_range(0, "end"), entry.focus_set()))
+                m.post(e.x_root, e.y_root)
+            entry.bind("<Button-3>", _make_menu)
+            entry.bind("<Control-a>", lambda e: (entry.select_range(0, "end"), "break"))
+            entry.bind("<Control-A>", lambda e: (entry.select_range(0, "end"), "break"))
+            entry.bind("<Escape>", lambda e: self.focus_set())
+            bind_word_delete(entry)
+            if hideable:
+                hide_var = tk.BooleanVar(value=self._cfg.get(hideable, True))
+                self._hide_vars[hideable] = hide_var
+                def _toggle_show(*_, hv=hide_var, e=entry):
+                    e.config(show="*" if hv.get() else "")
+                hide_var.trace_add("write", _toggle_show)
+                tk.Checkbutton(row_f, text="Hide", variable=hide_var,
+                               bg=BG, fg=GREY, selectcolor=BTN_BG,
+                               activebackground=BG, font=SMALL).pack(side="left", padx=(8, 0))
+            if extra_btn:
+                text_b, cmd = extra_btn
+                tk.Button(row_f, text=text_b, bg=BTN_BG, fg=FG, font=SMALL,
+                          relief="flat", padx=6, pady=3, cursor="hand2", bd=0,
+                          command=cmd).pack(side="left", padx=(6, 0))
+            return var
 
-        # Playtime unit
-        unit_row = tk.Frame(self, bg=BG)
-        unit_row.grid(row=13, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
-        tk.Label(unit_row, text="Playtime unit:", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
-        self._unit_cb = ttk.Combobox(
-            unit_row, textvariable=self._unit_var,
-            values=UNITS, state="readonly", width=10, font=FONT,
-        )
+        self._api_key_var = lfield(left, "API Key", "api_key", hideable="hide_api_key")
+        lnk = tk.Label(left, text="Get an API key →", bg=BG, fg=ACCENT, font=SMALL, cursor="hand2")
+        lnk.pack(anchor="w", pady=(2, 0))
+        lnk.bind("<Button-1>", lambda e: webbrowser.open("https://steamcommunity.com/dev/apikey"))
+
+        self._steam_id_var = lfield(left, "Steam ID / vanity name", "steam_id",
+                                    extra_btn=("Look up", self._lookup_steam_id))
+        tk.Label(left, text="Paste your 64-bit ID, profile URL, or vanity name.",
+                 bg=BG, fg=GREY, font=SMALL, wraplength=300, justify="left").pack(anchor="w", pady=(2, 0))
+
+        tk.Frame(left, bg=GREY, height=1).pack(fill="x", pady=(14, 10))
+
+        tk.Label(left, text="Session cookies", bg=BG, fg=ACCENT, font=FONT).pack(anchor="w", pady=(0, 2))
+        tk.Label(left,
+                 text="Optional. Required for automatic drop detection.\n"
+                      "Log into steamcommunity.com in your browser, open\n"
+                      "DevTools (F12) → Application → Cookies, and copy\n"
+                      "the values for sessionid and steamLoginSecure here.",
+                 bg=BG, fg=GREY, font=SMALL, justify="left").pack(anchor="w")
+        lnk2 = tk.Label(left, text="Open steamcommunity.com →", bg=BG, fg=ACCENT, font=SMALL, cursor="hand2")
+        lnk2.pack(anchor="w", pady=(2, 0))
+        lnk2.bind("<Button-1>", lambda e: webbrowser.open("https://steamcommunity.com/"))
+
+        self._session_var = lfield(left, "sessionid",        "session_id")
+        self._login_var   = lfield(left, "steamLoginSecure", "login_secure", hideable="hide_login_secure")
+        tk.Label(left, text="Cookies expire periodically. If drop detection stops working, re-enter them.\n"
+                            "You don't need to keep the browser tab open.",
+                 bg=BG, fg=GREY, font=SMALL, justify="left").pack(anchor="w", pady=(4, 0))
+
+        # ── Right panel: behaviour ───────────────────────────────────────────
+        right = tk.Frame(self, bg=BG)
+        right.grid(row=1, column=1, padx=(8, 16), pady=0, sticky="nwe")
+
+        tk.Label(right, text="Display", bg=BG, fg=ACCENT, font=FONT).pack(anchor="w", pady=(0, 6))
+        unit_row = tk.Frame(right, bg=BG)
+        unit_row.pack(anchor="w")
+        tk.Label(unit_row, text="Playtime unit", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        self._unit_cb = ttk.Combobox(unit_row, textvariable=self._unit_var,
+                                     values=UNITS, state="readonly", width=10, font=FONT)
         self._unit_cb.pack(side="left")
-        tk.Label(unit_row, text="(affects table, input fields, and summary bar)",
-                 bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(10, 0))
 
-        # Idle mode selector
-        tk.Label(self, text="Idle mode", bg=BG, fg=FG, font=FONT).grid(
-            row=14, column=0, columnspan=2, padx=16, pady=(8, 2), sticky="w")
+        tk.Frame(right, bg=GREY, height=1).pack(fill="x", pady=(12, 10))
+
+        tk.Label(right, text="Idle mode", bg=BG, fg=ACCENT, font=FONT).pack(anchor="w", pady=(0, 6))
 
         _MODE_INFO = [
-            ("multi",
-             "Multi-idle  (default)",
-             "Starts all games at the same time and keeps them running forever.\n"
-             "Cards drop while the game is running, roughly every 30 minutes per card on a normal\n"
-             "account. Running multiple games at once reduces the drop rate per game, so you won't\n"
-             "see cards arriving as fast, but all games are clocking time in parallel.\n"
-             "Use this if you have lots of games and just want to leave it running overnight."),
-            ("solo",
-             "Solo-idle  (one at a time)",
-             "Idles each game one at a time in list order. Gives each game the full drop rate\n"
-             "since nothing else is running. Checks drop count every few minutes (requires\n"
-             "session cookies) and moves on automatically when a game hits 0. Use this if you\n"
-             "have a small list or want to prioritise specific games."),
-            ("multi_then_solo",
-             "Multi then solo",
-             "First runs all games simultaneously until each hits a playtime threshold (set below),\n"
-             "then switches to solo-idle for drops. This is the classic two-phase workflow used by\n"
-             "Idle Master: the multi phase gets every game past the refund-protection gate\n"
-             "simultaneously, then solo phase farms the actual drops one by one at full drop rate.\n"
-             "Useful if your account has a 2-hour drop delay (new accounts or accounts that have\n"
-             "made recent refunds)."),
-            ("fast_cycle",
-             "Fast cycle",
-             "Runs all games simultaneously for a set interval, then rapidly stops and restarts\n"
-             "each one in sequence. Stopping a game causes Steam to deliver any drop that has\n"
-             "already been earned server-side. Rinse and repeat until all cards are collected.\n"
-             "This is the 'fast mode' from Idle Master Extended. May get drops faster than\n"
-             "solo-idle in practice, but results vary by account."),
+            ("multi",          "Multi-idle",
+             "Run all games simultaneously forever.\nGood for large libraries, slower drops per game."),
+            ("solo",           "Solo",
+             "One game at a time, full drop rate.\nMoves on automatically when a game hits 0 drops."),
+            ("multi_then_solo","Multi then solo",
+             "Multi-idle until a playtime threshold, then switch\nto solo. Use if your account has a 2-hour drop delay."),
+            ("fast_cycle",     "Fast cycle",
+             "Multi-idle for an interval, then stop/restart each\ngame to flush pending drops, then repeat."),
         ]
 
         self._mode_var = tk.StringVar(value=self._cfg.get("idle_mode", "multi"))
-        mode_frame = tk.Frame(self, bg=BG)
-        mode_frame.grid(row=15, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
-
         for val, label, desc in _MODE_INFO:
-            rb_frame = tk.Frame(mode_frame, bg=BG)
-            rb_frame.pack(anchor="w", pady=(0, 6))
-            tk.Radiobutton(
-                rb_frame, text=label, variable=self._mode_var, value=val,
-                bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG,
-                font=FONT, command=self._on_mode_change,
-            ).pack(anchor="w")
-            tk.Label(rb_frame, text=desc, bg=BG, fg=GREY, font=SMALL,
+            rb_f = tk.Frame(right, bg=BG)
+            rb_f.pack(anchor="w", pady=(0, 4))
+            tk.Radiobutton(rb_f, text=label, variable=self._mode_var, value=val,
+                           bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG,
+                           font=FONT, command=self._on_mode_change).pack(anchor="w")
+            tk.Label(rb_f, text=desc, bg=BG, fg=GREY, font=SMALL,
                      justify="left").pack(anchor="w", padx=(22, 0))
 
-        # Per-mode option rows, shown/hidden based on selected mode
-        # --- multi_then_solo: playtime threshold ---
-        self._thresh_frame = tk.Frame(self, bg=BG)
-        self._thresh_frame.grid(row=16, column=0, columnspan=2, padx=36, pady=(0, 4), sticky="w")
-        tk.Label(self._thresh_frame, text="Switch to solo after", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
+        # Per-mode options
+        def time_row(parent, label, val_var, unit_var, units, hint):
+            f = tk.Frame(parent, bg=BG)
+            tk.Label(f, text=label, bg=BG, fg=FG, font=FONT).pack(anchor="w", pady=(6, 1))
+            inner = tk.Frame(f, bg=BG)
+            inner.pack(anchor="w")
+            tk.Entry(inner, textvariable=val_var, bg=ENTRY_BG, fg=FG, font=FONT,
+                     relief="flat", insertbackground=FG, width=6).pack(side="left")
+            ttk.Combobox(inner, textvariable=unit_var, values=units,
+                         state="readonly", width=8, font=FONT).pack(side="left", padx=(4, 0))
+            if hint:
+                tk.Label(inner, text=hint, bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+            return f
+
         thresh_sec = float(self._cfg.get("phase1_threshold_seconds", 7200.0))
-        thresh_unit_default, thresh_val_default = _sec_to_display(thresh_sec)
-        self._thresh_val_var  = tk.StringVar(value=str(thresh_val_default))
-        self._thresh_unit_var = tk.StringVar(value=thresh_unit_default)
-        tk.Entry(self._thresh_frame, textvariable=self._thresh_val_var, bg=ENTRY_BG, fg=FG,
-                 font=FONT, relief="flat", insertbackground=FG, width=6).pack(side="left")
-        ttk.Combobox(self._thresh_frame, textvariable=self._thresh_unit_var,
-                     values=["seconds", "minutes", "hours"], state="readonly",
-                     width=8, font=FONT).pack(side="left", padx=(4, 0))
-        tk.Label(self._thresh_frame, text="per game", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+        tu, tv = _sec_to_display(thresh_sec)
+        self._thresh_val_var  = tk.StringVar(value=str(tv))
+        self._thresh_unit_var = tk.StringVar(value=tu)
+        self._thresh_frame = time_row(right, "Switch to solo after",
+                                      self._thresh_val_var, self._thresh_unit_var,
+                                      ["seconds", "minutes", "hours"], "per game")
 
-        # --- solo + multi_then_solo: drop check interval ---
-        self._poll_frame = tk.Frame(self, bg=BG)
-        self._poll_frame.grid(row=17, column=0, columnspan=2, padx=36, pady=(0, 4), sticky="w")
-        tk.Label(self._poll_frame, text="Check for drops every", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
         poll_sec = float(self._cfg.get("phase2_poll_seconds", 300.0))
-        poll_unit_default, poll_val_default = _sec_to_display(poll_sec)
-        self._poll_val_var  = tk.StringVar(value=str(poll_val_default))
-        self._poll_unit_var = tk.StringVar(value=poll_unit_default)
-        tk.Entry(self._poll_frame, textvariable=self._poll_val_var, bg=ENTRY_BG, fg=FG,
-                 font=FONT, relief="flat", insertbackground=FG, width=6).pack(side="left")
-        ttk.Combobox(self._poll_frame, textvariable=self._poll_unit_var,
-                     values=["seconds", "minutes", "hours"], state="readonly",
-                     width=8, font=FONT).pack(side="left", padx=(4, 0))
-        tk.Label(self._poll_frame, text="(requires session cookies)", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+        pu, pv = _sec_to_display(poll_sec)
+        self._poll_val_var  = tk.StringVar(value=str(pv))
+        self._poll_unit_var = tk.StringVar(value=pu)
+        self._poll_frame = time_row(right, "Check for drops every",
+                                    self._poll_val_var, self._poll_unit_var,
+                                    ["seconds", "minutes", "hours"], "(requires cookies)")
 
-        # --- fast_cycle: cycle duration ---
-        self._cycle_frame = tk.Frame(self, bg=BG)
-        self._cycle_frame.grid(row=18, column=0, columnspan=2, padx=36, pady=(0, 4), sticky="w")
-        tk.Label(self._cycle_frame, text="Multi-idle for", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
         cycle_sec = float(self._cfg.get("fast_cycle_seconds", 1800.0))
-        cycle_unit_default, cycle_val_default = _sec_to_display(cycle_sec)
-        self._cycle_val_var  = tk.StringVar(value=str(cycle_val_default))
-        self._cycle_unit_var = tk.StringVar(value=cycle_unit_default)
-        tk.Entry(self._cycle_frame, textvariable=self._cycle_val_var, bg=ENTRY_BG, fg=FG,
-                 font=FONT, relief="flat", insertbackground=FG, width=6).pack(side="left")
-        ttk.Combobox(self._cycle_frame, textvariable=self._cycle_unit_var,
-                     values=["seconds", "minutes", "hours"], state="readonly",
-                     width=8, font=FONT).pack(side="left", padx=(4, 0))
-        tk.Label(self._cycle_frame, text="per cycle before collecting drops", bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+        cu, cv = _sec_to_display(cycle_sec)
+        self._cycle_val_var  = tk.StringVar(value=str(cv))
+        self._cycle_unit_var = tk.StringVar(value=cu)
+        self._cycle_frame = time_row(right, "Multi-idle for",
+                                     self._cycle_val_var, self._cycle_unit_var,
+                                     ["seconds", "minutes", "hours"], "per cycle")
 
-        self._pause_frame = tk.Frame(self, bg=BG)
-        self._pause_frame.grid(row=19, column=0, columnspan=2, padx=36, pady=(0, 4), sticky="w")
-        tk.Label(self._pause_frame, text="Pause after stopping each game for", bg=BG, fg=FG, font=FONT).pack(side="left", padx=(0, 8))
         pause_sec = float(self._cfg.get("fast_cycle_stop_pause_seconds", 5.0))
-        pause_unit_default, pause_val_default = _sec_to_display(pause_sec)
-        self._pause_val_var  = tk.StringVar(value=str(pause_val_default))
-        self._pause_unit_var = tk.StringVar(value=pause_unit_default)
-        tk.Entry(self._pause_frame, textvariable=self._pause_val_var, bg=ENTRY_BG, fg=FG,
-                 font=FONT, relief="flat", insertbackground=FG, width=6).pack(side="left")
-        ttk.Combobox(self._pause_frame, textvariable=self._pause_unit_var,
-                     values=["seconds", "minutes"], state="readonly",
-                     width=8, font=FONT).pack(side="left", padx=(4, 0))
-        tk.Label(self._pause_frame, text="so Steam registers the session end",
-                 bg=BG, fg=GREY, font=SMALL).pack(side="left", padx=(6, 0))
+        pau, pav = _sec_to_display(pause_sec)
+        self._pause_val_var  = tk.StringVar(value=str(pav))
+        self._pause_unit_var = tk.StringVar(value=pau)
+        self._pause_frame = time_row(right, "Pause after stopping each game",
+                                     self._pause_val_var, self._pause_unit_var,
+                                     ["seconds", "minutes"], "for Steam to register")
 
-        self._on_mode_change()  # set initial visibility
+        self._on_mode_change()
 
-        # Merge refresh buttons
+        tk.Frame(right, bg=GREY, height=1).pack(fill="x", pady=(14, 10))
+
+        tk.Label(right, text="Behaviour", bg=BG, fg=ACCENT, font=FONT).pack(anchor="w", pady=(0, 6))
+
         self._merge_refresh_var = tk.BooleanVar(value=self._cfg.get("merge_refresh_buttons", False))
-        tk.Checkbutton(
-            self,
-            text='Merge "Refresh Drops" and "Refresh Playtimes" into a single "Refresh" button',
-            variable=self._merge_refresh_var,
-            bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=20, column=0, columnspan=2, padx=16, pady=(8, 2), sticky="w")
+        tk.Checkbutton(right, text='Merge "Refresh Drops" and "Refresh Playtimes"\ninto a single "Refresh" button',
+                       variable=self._merge_refresh_var,
+                       bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG,
+                       font=FONT, justify="left").pack(anchor="w", pady=(0, 4))
 
-        # Auto-remove completed
         self._auto_remove_var = tk.BooleanVar(value=self._cfg.get("auto_remove_completed", False))
-        tk.Checkbutton(
-            self,
-            text="Automatically remove a game from the list once all its cards are dropped",
-            variable=self._auto_remove_var,
-            bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG, font=FONT,
-        ).grid(row=21, column=0, columnspan=2, padx=16, pady=(2, 4), sticky="w")
+        tk.Checkbutton(right, text="Auto-remove games once all cards are dropped",
+                       variable=self._auto_remove_var,
+                       bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG,
+                       font=FONT).pack(anchor="w")
 
+        # ── Bottom bar: Save / Cancel ────────────────────────────────────────
+        sep = tk.Frame(self, bg=GREY, height=1)
+        sep.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 0))
         bf = tk.Frame(self, bg=BG)
-        bf.grid(row=22, column=0, columnspan=2, pady=(12, 16), padx=16, sticky="e")
+        bf.grid(row=3, column=0, columnspan=2, pady=(10, 16), padx=16, sticky="e")
         tk.Button(bf, text="Save",   bg=ACCENT, fg="#fff", font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self._save
                   ).pack(side="right", padx=(6, 0))
-        tk.Button(bf, text="Cancel", bg=BTN_BG, fg=FG,    font=FONT, relief="flat",
+        tk.Button(bf, text="Cancel", bg=BTN_BG, fg=FG, font=FONT, relief="flat",
                   padx=10, pady=5, cursor="hand2", bd=0, command=self.destroy
                   ).pack(side="right")
 
     def _on_mode_change(self):
         mode = self._mode_var.get()
-        # thresh: only multi_then_solo
         if mode == "multi_then_solo":
-            self._thresh_frame.grid()
+            self._thresh_frame.pack(anchor="w")
         else:
-            self._thresh_frame.grid_remove()
-        # poll: solo and multi_then_solo
+            self._thresh_frame.pack_forget()
         if mode in ("solo", "multi_then_solo"):
-            self._poll_frame.grid()
+            self._poll_frame.pack(anchor="w")
         else:
-            self._poll_frame.grid_remove()
-        # cycle duration + stop pause: only fast_cycle
+            self._poll_frame.pack_forget()
         if mode == "fast_cycle":
-            self._cycle_frame.grid()
-            self._pause_frame.grid()
+            self._cycle_frame.pack(anchor="w")
+            self._pause_frame.pack(anchor="w")
         else:
-            self._cycle_frame.grid_remove()
-            self._pause_frame.grid_remove()
+            self._cycle_frame.pack_forget()
+            self._pause_frame.pack_forget()
 
     def _lookup_steam_id(self):
         key = self._api_key_var.get().strip()
