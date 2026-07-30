@@ -420,19 +420,22 @@ def fetch_app_card_drops(session_id: str, login_secure: str, app_id: str, steam_
     )
     html = _http_get(url, cookies=cookies)
 
-    # The gamecards page does NOT include <a class="user_avatar"> — that element
-    # only appears on other Steam page types. Check the data-userinfo JSON blob
-    # instead, which Steam always embeds when the session is valid.
-    is_logged_in = '"logged_in":true' in html or '"logged_in": true' in html
+    parser = _ProgressInfoParser()
+    parser.feed(html)
+
+    # Same session-validity check used by fetch_card_drops_bulk (the badges
+    # page): look for <a class="user_avatar">, which Steam renders in the
+    # page header whenever the request cookies are valid. Also accept the
+    # data-userinfo "logged_in" JSON flag as a fallback in case Steam ever
+    # omits the avatar link on this page layout but still marks the session
+    # as logged in. Only fail if BOTH signals say we're not authorized.
+    is_logged_in = parser.is_authorized or '"logged_in":true' in html or '"logged_in": true' in html
     if not is_logged_in:
         _maybe_dump_debug_html(f"unauthorized_gamecards_{app_id}", html)
         raise ValueError(
             "Steam didn't recognize the session (not logged in on the gamecards page). "
             "Your session cookies have likely expired. Re-enter them in Settings."
         )
-
-    parser = _ProgressInfoParser()
-    parser.feed(html)
 
     if parser.progress_text is not None:
         text = parser.progress_text.strip()
