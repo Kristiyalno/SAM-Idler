@@ -124,7 +124,7 @@ Double-click any cell to edit inline. Click elsewhere, Enter, or Escape to commi
 | `#` | Type a new position number to move the row |
 | App ID | Edit the App ID directly |
 | Name | Edit the game name |
-| Playtime | Type a new value in the current unit |
+| Playtime | Type a value in the current unit, or use a suffix to override it: `3h`, `90m`, `45s`, `2d` |
 | Drops left | Type a number; setting it to 0 also marks cards done |
 | Solo ready | Double-click to toggle yes/no - only relevant in "multi then solo" mode, ignored in all other modes |
 | Cards done | Double-click to toggle yes/no |
@@ -218,3 +218,11 @@ The log records every event with a full timestamp. You can select and copy text 
 Most likely your session cookies have expired. Re-enter `sessionid` and `steamLoginSecure` in Settings. The log will say specifically what failed.
 
 If it still does not work after fresh cookies, set the environment variable `SAM_IDLER_DEBUG_HTML=1` before launching; the raw page HTML is saved to `debug_html/` for inspection.
+
+## VAC and anti-cheat
+
+When the app starts or you import games, it checks each game's VAC status via the Steam store API and shows the result in the VAC column (`yes` / `no` / `?`). If any VAC-enabled games are in your list when you click Start Idling, you will be asked to confirm before the session starts.
+
+The risk is not from idling itself. It comes from running the idler while you are actively connected to a VAC-secured server on the same machine. If VAC scans while SAM.Game.exe is open alongside a VAC-protected game session, it could flag it. Pause the idler before launching any VAC-protected multiplayer game.
+
+**Rust specifically:** Rust shows as VAC-enabled on its Steam store page but uses Easy Anti-Cheat (EAC) in practice and issues game bans, not VAC bans. The VAC label on Rust's store page is a legacy listing. EAC is a separate system — idling Rust while actively playing it is still worth avoiding out of caution, but it is not a VAC concern.

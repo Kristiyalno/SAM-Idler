@@ -85,24 +85,41 @@ UNIT_FROM_HOURS = {"minutes": 60.0, "hours": 1.0, "seconds": 3600.0, "days": 1/2
 
 def parse_playtime(raw: str, unit: str) -> float:
     """
-    Parse a user-typed playtime string in the given unit and return hours.
-    Accepts: '1.5', '1,5', '.5', ',5', '1,500' (treated as 1.5 not 1500).
+    Parse a user-typed playtime string and return hours.
+    Accepts the current unit by default, but also recognises explicit suffixes:
+      3h / 3hr / 3hours -> hours
+      90m / 90min / 90minutes -> minutes
+      45s / 45sec / 45seconds -> seconds
+      2d / 2days -> days
+    Examples: '1.5', '3h', '90m', '1,5h', '45s'
+    If no suffix is given, the current display unit is assumed.
     """
     if raw is None:
         return 0.0
-    s = raw.strip().replace(" ", "")
-    # Replace comma used as decimal separator (e.g. '1,5' -> '1.5')
-    # But not thousand separators: if there are digits on both sides and
-    # more than 2 digits after the comma, treat as thousands sep; otherwise decimal.
+    s = raw.strip().replace(" ", "").lower()
+
+    # Check for explicit unit suffix (letters at the end)
+    suffix_match = re.match(r"^([0-9.,]+)(h(?:r|ours?)?|m(?:in(?:utes?)?)?|s(?:ec(?:onds?)?)?|d(?:ays?)?)$", s)
+    if suffix_match:
+        num_str, sfx = suffix_match.groups()
+        if sfx.startswith("h"):
+            explicit_unit = "hours"
+        elif sfx.startswith("m"):
+            explicit_unit = "minutes"
+        elif sfx.startswith("s"):
+            explicit_unit = "seconds"
+        else:
+            explicit_unit = "days"
+        s = num_str
+        unit = explicit_unit
+
     def _fix_comma(t: str) -> str:
-        # Replace a lone leading comma: ',5' -> '0.5'
         if t.startswith(","):
             t = "0." + t[1:]
-        # Replace comma used as decimal if pattern is digits,1-2digits
         t = re.sub(r"(\d),(\d{1,2})$", r"\1.\2", t)
-        # Any remaining commas are thousand separators - remove them
         t = t.replace(",", "")
         return t
+
     s = _fix_comma(s)
     try:
         value = float(s)
@@ -113,6 +130,21 @@ def parse_playtime(raw: str, unit: str) -> float:
 
 def hours_to_unit(hours: float, unit: str) -> float:
     return hours * UNIT_FROM_HOURS.get(unit, 1.0)
+
+
+def phase1_done_for_playtime(hours: float, config: dict) -> bool:
+    """
+    Whether a game counts as "solo ready" for a given playtime.
+    This threshold only means anything in multi_then_solo mode, where it's
+    the gate for handing a game off from multi-idle to solo-idle. In every
+    other mode there is no handoff, so the flag is left permanently True
+    (its harmless default) instead of being recomputed against a threshold
+    that doesn't apply to the current mode.
+    """
+    if config.get("idle_mode", "multi") != "multi_then_solo":
+        return True
+    thresh_h = float(config.get("phase1_threshold_seconds", 7200.0) / 3600)
+    return hours >= thresh_h
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +428,7 @@ def fetch_app_card_drops(session_id: str, login_secure: str, app_id: str, steam_
         _maybe_dump_debug_html(f"unauthorized_gamecards_{app_id}", html)
         raise ValueError(
             "Steam didn't recognize the session (not logged in on the gamecards page). "
-            "Your session cookies have likely expired — re-enter them in Settings."
+            "Your session cookies have likely expired. Re-enter them in Settings."
         )
 
     parser = _ProgressInfoParser()
@@ -483,6 +515,25 @@ class _BadgeParser(HTMLParser):
             first_word = text.split(" ", 1)[0] if text else ""
             if first_word.isdigit() and self._current_appid:
                 self.drops[self._current_appid] = int(first_word)
+
+
+def is_vac_enabled(app_id: str) -> bool | None:
+    """
+    Returns True if the app has VAC enabled, False if not, None if the check failed.
+    Uses the Steam store appdetails API which is public and requires no auth.
+    category id 8 = VAC enabled.
+    """
+    try:
+        url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&filters=categories"
+        raw = _http_get(url)
+        data = json.loads(raw)
+        app_data = data.get(str(app_id), {})
+        if not app_data.get("success"):
+            return None
+        categories = app_data.get("data", {}).get("categories", [])
+        return any(c.get("id") == 8 for c in categories)
+    except Exception:
+        return None
 
 
 def fetch_card_drops_bulk(session_id: str, login_secure: str, steam_id: str = "") -> dict[str, int]:
@@ -1200,6 +1251,77 @@ def _display_to_sec(val_str: str, unit: str) -> float:
         return max(0.0, float(val_str.strip().replace(",", ".")) * multipliers.get(unit, 60.0))
     except ValueError:
         return multipliers.get(unit, 60.0)  # default to 1 unit
+
+
+class VacWarningDialog(tk.Toplevel):
+    """
+    Shown before starting the idler if any game in the list is VAC-enabled.
+    Offers three choices instead of a plain yes/no: start anyway, remove the
+    VAC games from the list and start, or cancel. self.result ends up as
+    one of "start", "remove_and_start", or None (cancelled / closed).
+    """
+    def __init__(self, parent, vac_names: list[str]):
+        super().__init__(parent)
+        self.title("VAC-enabled games in list")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self.result: str | None = None
+        self._build(vac_names)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_window()
+
+    def _build(self, vac_names: list[str]):
+        pad = dict(padx=18)
+        tk.Label(self, text="VAC-enabled games in list", font=TITLE, bg=BG, fg=WARN).pack(
+            anchor="w", pady=(14, 8), **pad
+        )
+
+        shown = vac_names[:10]
+        names_text = "\n".join(f"  -  {n}" for n in shown)
+        if len(vac_names) > 10:
+            names_text += f"\n  ...  and {len(vac_names) - 10} more"
+        tk.Label(self, text="The following game(s) have VAC enabled:", bg=BG, fg=FG, font=FONT,
+                 anchor="w", justify="left").pack(anchor="w", pady=(0, 4), **pad)
+        names_lbl = tk.Label(self, text=names_text, bg=BG, fg=FG, font=MONO,
+                              anchor="w", justify="left")
+        names_lbl.pack(anchor="w", pady=(0, 10), **pad)
+
+        body = (
+            "Running the idler while connected to a VAC-secured server on the same machine "
+            "can get you kicked or game-banned from that server. This will not happen just "
+            "from idling, only if you also play a VAC game at the same time.\n\n"
+            "Pause the idler before launching any VAC-protected multiplayer game."
+        )
+        tk.Label(self, text=body, bg=BG, fg=GREY, font=SMALL, wraplength=420,
+                 anchor="w", justify="left").pack(anchor="w", pady=(0, 14), **pad)
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(anchor="e", pady=(0, 14), **pad)
+
+        def _mk(text, command, accent=False, danger=False):
+            bg = ACCENT if accent else ("#7a2020" if danger else BTN_BG)
+            fg = "#fff" if (accent or danger) else FG
+            return tk.Button(btn_row, text=text, command=command, bg=bg, fg=fg,
+                              activebackground=ACCENT, activeforeground="#fff",
+                              font=FONT, relief="flat", padx=10, pady=5, cursor="hand2", bd=0)
+
+        _mk("Cancel", self._cancel).pack(side="left", padx=(0, 6))
+        _mk("Remove VAC games and start", self._remove_and_start, danger=True).pack(side="left", padx=(0, 6))
+        _mk("Start anyway", self._start, accent=True).pack(side="left")
+
+    def _start(self):
+        self.result = "start"
+        self.destroy()
+
+    def _remove_and_start(self):
+        self.result = "remove_and_start"
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 class SettingsDialog(tk.Toplevel):
@@ -2052,6 +2174,7 @@ class App(tk.Tk):
         self._build_ui()
         self._refresh_table()
         self._summary.refresh(self.games, self._unit_var.get(), threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600), idle_mode=self.config.get("idle_mode", "multi"), is_running=self._running)
+        self.after(500, self._check_vac_in_background)
 
         # Clicking on empty space unfocuses any active entry/cell editor
         self.bind("<Button-1>", self._maybe_unfocus_on_click)
@@ -2169,7 +2292,7 @@ class App(tk.Tk):
                  text="Drag rows to reorder. Double-click a cell to edit. Solo mode idles in list order.",
                  font=SMALL, bg=BG, fg=GREY, anchor="w").pack(anchor="w", pady=(0, 4))
 
-        cols = ("order", "app_id", "name", "playtime", "drops", "phase1", "cards")
+        cols = ("order", "app_id", "name", "playtime", "drops", "phase1", "cards", "vac")
         self._tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="extended")
         self._style_tree()
 
@@ -2180,6 +2303,7 @@ class App(tk.Tk):
         self._tree.heading("drops",    text="Drops left",command=lambda: self._sort_by("drops"))
         self._tree.heading("phase1",   text="Solo ready", command=lambda: self._sort_by("phase1"))
         self._tree.heading("cards",    text="Cards done",command=lambda: self._sort_by("cards"))
+        self._tree.heading("vac",      text="VAC",       command=lambda: self._sort_by("vac"))
 
         self._tree.column("order",    width=38,  anchor="center", stretch=False)
         self._tree.column("app_id",   width=82,  anchor="center", stretch=False)
@@ -2188,6 +2312,7 @@ class App(tk.Tk):
         self._tree.column("drops",    width=78,  anchor="center", stretch=False)
         self._tree.column("phase1",   width=70,  anchor="center", stretch=False)
         self._tree.column("cards",    width=84,  anchor="center", stretch=False)
+        self._tree.column("vac",      width=44,  anchor="center", stretch=False)
 
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
@@ -2520,12 +2645,26 @@ class App(tk.Tk):
             text = base + arrow if col == self._sort_col else base
             self._tree.heading(col, text=text)
 
+    def _update_column_visibility(self):
+        """Solo ready only means anything in multi_then_solo mode (it's the
+        multi-idle -> solo handoff flag). In every other mode it's not a
+        real state the user set, just whatever it happened to default to,
+        so showing it as a column invites reading meaning into a value that
+        has none. Hide it outside multi_then_solo, matching the summary bar
+        which already hides its solo-ready stats the same way."""
+        all_cols = ("order", "app_id", "name", "playtime", "drops", "phase1", "cards", "vac")
+        if self.config.get("idle_mode", "multi") == "multi_then_solo":
+            self._tree.configure(displaycolumns=all_cols)
+        else:
+            self._tree.configure(displaycolumns=tuple(c for c in all_cols if c != "phase1"))
+
     def _refresh_table(self):
         sel     = self._tree.selection()
         sel_iids = set(sel)
         self._tree.delete(*self._tree.get_children())
 
         self._update_heading_arrows()
+        self._update_column_visibility()
 
         search_raw = self._search_var.get() if hasattr(self, "_search_var") else ""
         search_norm = self._filter_normalize(search_raw)
@@ -2546,6 +2685,7 @@ class App(tk.Tk):
             else:
                 tag = "odd"
             drops_str = str(g["cards_remaining"]) if g["cards_remaining"] >= 0 else "?"
+            vac_val = "yes" if g.get("vac_enabled") is True else ("no" if g.get("vac_enabled") is False else "?")
             self._tree.insert("", "end", iid=str(orig_idx),
                 values=(
                     orig_idx + 1,
@@ -2555,6 +2695,7 @@ class App(tk.Tk):
                     drops_str,
                     "yes" if g["phase1_done"] else "no",
                     "yes" if g["cards_done"]  else "no",
+                    vac_val,
                 ),
                 tags=(tag,))
 
@@ -2593,6 +2734,7 @@ class App(tk.Tk):
                             continue
                     tag = "active" if g["phase1_done"] else ("even" if display_pos % 2 == 0 else "odd")
                     drops_str = str(g["cards_remaining"]) if g["cards_remaining"] >= 0 else "?"
+                    vac_val = "yes" if g.get("vac_enabled") is True else ("no" if g.get("vac_enabled") is False else "?")
                     self._tree.insert("", "end", iid=str(orig_idx),
                         values=(
                             orig_idx + 1,
@@ -2602,6 +2744,7 @@ class App(tk.Tk):
                             drops_str,
                             "yes" if g["phase1_done"] else "no",
                             "yes" if g["cards_done"]  else "no",
+                            vac_val,
                         ),
                         tags=(tag,))
                 self._summary.refresh(self.games, self._unit, threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600), idle_mode=self.config.get("idle_mode", "multi"), is_running=self._running)
@@ -2684,7 +2827,7 @@ class App(tk.Tk):
             hours = parse_playtime(raw, self._unit)
             for idx in indices:
                 self.games[idx]["playtime_hours"] = hours
-                self.games[idx]["phase1_done"] = hours >= float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
+                self.games[idx]["phase1_done"] = phase1_done_for_playtime(hours, self.config)
         elif edit_type == "drops":
             raw = simpledialog.askstring(
                 "Bulk Edit", f"Set drops remaining for {len(indices)} game(s):", parent=self
@@ -2761,7 +2904,7 @@ class App(tk.Tk):
             self._push_undo()
             hours = parse_playtime(raw_val, self._unit)
             g["playtime_hours"] = hours
-            g["phase1_done"]    = hours >= float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
+            g["phase1_done"]    = phase1_done_for_playtime(hours, self.config)
             save_games(self.games)
             self._refresh_table()
             return
@@ -3195,6 +3338,7 @@ class App(tk.Tk):
         if added:
             save_games(self.games)
             self._refresh_table()
+            self._check_vac_in_background()
         if added or skipped:
             msg = f"Added {added} game(s)."
             if skipped:
@@ -3228,6 +3372,22 @@ class App(tk.Tk):
         if is_dupe:
             self._append_log(f"App {app_id} is already in the list, adding another entry won't be blocked.")
 
+        # VAC check — runs in background so it doesn't block the UI for long
+        vac = is_vac_enabled(app_id)
+        if vac is True:
+            proceed = messagebox.askyesno(
+                "VAC-enabled game",
+                f"App {app_id} has VAC (Valve Anti-Cheat) enabled.\n\n"
+                "Idling a VAC game while you are actively playing another VAC-secured game "
+                "on the same machine can cause you to be kicked or temporarily banned from "
+                "that game's servers.\n\n"
+                "To be safe: pause the idler before launching any VAC-protected multiplayer game.\n\n"
+                "Add it anyway?",
+                parent=self,
+            )
+            if not proceed:
+                return
+
         name = simpledialog.askstring("Add via App ID", "Game name (optional):", parent=self)
         if name is None:
             return   # user cancelled
@@ -3241,10 +3401,11 @@ class App(tk.Tk):
             return   # user cancelled
 
         hours = parse_playtime(pt, self._unit)
-        thresh = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
         self._push_undo()
         game = default_game(app_id, name or "", hours)
-        game["phase1_done"] = hours >= thresh
+        game["phase1_done"] = phase1_done_for_playtime(hours, self.config)
+        if vac is True:
+            game["vac_enabled"] = True
         self.games.append(game)
         save_games(self.games)
         self._refresh_table()
@@ -3422,11 +3583,10 @@ class App(tk.Tk):
                 if not targets:
                     return
                 t = targets[0]
-                thresh = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
                 msgs = []
                 if new_pt is not None:
                     t["playtime_hours"] = new_pt
-                    t["phase1_done"]    = new_pt >= thresh
+                    t["phase1_done"]    = phase1_done_for_playtime(new_pt, self.config)
                     msgs.append(f"playtime = {new_pt:.1f}h")
                 if new_drops is not None:
                     t["cards_remaining"] = new_drops
@@ -3454,7 +3614,6 @@ class App(tk.Tk):
         self._append_log(f"Refreshing playtimes for {len(self.games)} game(s)...")
         api_key  = self.config["api_key"]
         steam_id = self.config["steam_id"]
-        thresh   = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
 
         def _fetch():
             try:
@@ -3469,7 +3628,7 @@ class App(tk.Tk):
                 for g in self.games:
                     if g["app_id"] in pt_map:
                         g["playtime_hours"] = pt_map[g["app_id"]]
-                        g["phase1_done"]    = g["playtime_hours"] >= thresh
+                        g["phase1_done"]    = phase1_done_for_playtime(g["playtime_hours"], self.config)
                         updated += 1
                 save_games(self.games)
                 self._refresh_table()
@@ -3477,6 +3636,31 @@ class App(tk.Tk):
             self._dispatch(_apply)
 
         threading.Thread(target=_fetch, daemon=True).start()
+
+    def _check_vac_in_background(self):
+        """Check VAC status for any games without a stored vac_enabled value.
+        Runs in a background thread, updates game dicts and refreshes the table
+        as results come in one by one."""
+        unchecked = [g for g in self.games if g.get("vac_enabled") is None]
+        if not unchecked:
+            return
+        self._append_log(f"Checking VAC status for {len(unchecked)} game(s)...")
+        def _run():
+            for g in unchecked:
+                result = is_vac_enabled(g["app_id"])
+                if result is not None:
+                    g["vac_enabled"] = result
+                self._dispatch(self._refresh_table)
+            save_games(self.games)
+            vac_count = sum(1 for g in self.games if g.get("vac_enabled") is True)
+            if vac_count:
+                self._dispatch(lambda: self._append_log(
+                    f"VAC check done: {vac_count} VAC-enabled game(s) in your list. "
+                    "Pause the idler before playing any VAC-secured game."
+                ))
+            else:
+                self._dispatch(lambda: self._append_log("VAC check done: no VAC-enabled games found."))
+        threading.Thread(target=_run, daemon=True).start()
 
     def _start_idling(self):
         if self._running:
@@ -3489,6 +3673,23 @@ class App(tk.Tk):
                 f"SAM.Game.exe was not found at:\n{SAM_GAME_EXE}\n\n"
                 "Place SAM.Game.exe and SAM.API.dll in the same directory as this script.")
             return
+
+        vac_games = [g["name"] for g in self.games if g.get("vac_enabled") is True]
+        if vac_games:
+            dlg = VacWarningDialog(self, vac_games)
+            if dlg.result is None:
+                return
+            if dlg.result == "remove_and_start":
+                self._push_undo()
+                removed = len(vac_games)
+                self.games[:] = [g for g in self.games if g.get("vac_enabled") is not True]
+                save_games(self.games)
+                self._refresh_table()
+                self._append_log(f"Removed {removed} VAC-enabled game(s) before starting.")
+                if not self.games:
+                    messagebox.showinfo("No games", "All games in the list were VAC-enabled and have been removed. Add at least one non-VAC game first.")
+                    return
+            # dlg.result == "start" falls through and idles as normal
 
         self._running = True
         self._start_btn.config(state="disabled")
