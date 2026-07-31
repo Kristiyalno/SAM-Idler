@@ -152,18 +152,21 @@ def phase1_done_for_playtime(hours: float, config: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_CONFIG = {
+    "config_version": 2,
     "api_key": "", "steam_id": "",
     "session_id": "", "login_secure": "",
     "playtime_unit": "minutes",
     "hide_api_key": True,
     "hide_login_secure": True,
     "idle_mode": "multi",
-    "phase1_threshold_seconds": 7200.0,   # 2 hours default
-    "phase2_poll_seconds": 300.0,         # 5 minutes default
-    "fast_cycle_seconds": 1800.0,         # 30 minutes default
-    "fast_cycle_stop_pause_seconds": 5.0, # pause after stopping each game
+    "phase1_threshold_seconds": 7200.0,
+    "phase2_poll_seconds": 300.0,
+    "fast_cycle_seconds": 300.0,
+    "fast_cycle_stop_pause_seconds": 5.0,
     "merge_refresh_buttons": False,
     "auto_remove_completed": False,
+    "minimize_to_tray": False,
+    "auto_start_idling": False,
 }
 
 
@@ -212,6 +215,8 @@ def _migrate_config(cfg: dict) -> None:
         cfg["phase2_poll_seconds"] = float(cfg.pop("phase2_poll_minutes")) * 60
     if "fast_cycle_minutes" in cfg and "fast_cycle_seconds" not in cfg:
         cfg["fast_cycle_seconds"] = float(cfg.pop("fast_cycle_minutes")) * 60
+    # Stamp current version so future migrations can be keyed on it.
+    cfg.setdefault("config_version", 2)
 
 
 def _sanitize_game(entry) -> dict | None:
@@ -231,6 +236,8 @@ def _sanitize_game(entry) -> dict | None:
         cards_remaining = int(entry.get("cards_remaining", -1))
     except (TypeError, ValueError):
         cards_remaining = -1
+    vac_raw = entry.get("vac_enabled")
+    vac_enabled = True if vac_raw is True else (False if vac_raw is False else None)
     return {
         "app_id": app_id,
         "name": name,
@@ -238,6 +245,7 @@ def _sanitize_game(entry) -> dict | None:
         "cards_remaining": cards_remaining,
         "phase1_done": bool(entry.get("phase1_done", True)),
         "cards_done": bool(entry.get("cards_done", False)),
+        "vac_enabled": vac_enabled,
     }
 
 
@@ -297,7 +305,7 @@ def default_game(app_id: str, name: str = "", playtime_h: float = 0.0, cards_rem
 # ---------------------------------------------------------------------------
 
 def _http_get(url: str, cookies: dict | None = None, timeout: int = 15) -> str:
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
     if cookies:
         headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
     req = urllib.request.Request(url, headers=headers)
@@ -631,6 +639,7 @@ class IdleStatus:
         self.phase1_running: list[str] = []
         self.elapsed_sec: float = 0.0
         self.next_check_sec: float = 0.0
+        self.eta_sec: float = -1.0   # -1 means unknown; >= 0 is estimated seconds until game is done
         self.drops_checked: bool = False
         self.crash_notice: str = ""
         self.paused: bool = False
@@ -734,9 +743,9 @@ class IdleController:
 
     # Phase 1 ---------------------------------------------------------------
 
-    def _run_phase1(self):
+    def _run_phase1(self, force_infinite: bool = False):
         threshold_h = float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600)
-        infinite    = threshold_h <= 0.0
+        infinite    = force_infinite or threshold_h <= 0.0
 
         if infinite:
             targets = list(self.games)   # all games, never stop by time
@@ -926,6 +935,11 @@ class IdleController:
             gave_up      = False
             last_giveup_retry = 0.0
             last_crash_check  = time.time()
+            # ETA tracking: record (elapsed_sec, drops_remaining) each time a
+            # drop count is confirmed so we can estimate remaining time.
+            _eta_samples: list[tuple[float, int]] = []
+            if g["cards_remaining"] > 0:
+                _eta_samples.append((0.0, g["cards_remaining"]))
 
             while not self._stop.is_set() and not self._next.is_set():
                 self._stop.wait(1)
@@ -976,8 +990,23 @@ class IdleController:
                     self._emit()
                     continue
 
-                self._status.elapsed_sec    = now - game_start - paused_secs
+                elapsed_sec = now - game_start - paused_secs
+                self._status.elapsed_sec    = elapsed_sec
                 self._status.next_check_sec = max(0.0, poll_sec - (now - last_poll - paused_since_poll))
+
+                # Recompute ETA from samples: fit a linear drop rate and project.
+                if len(_eta_samples) >= 2:
+                    t0, d0 = _eta_samples[0]
+                    t1, d1 = _eta_samples[-1]
+                    dropped = d0 - d1
+                    if dropped > 0 and t1 > t0:
+                        secs_per_drop = (t1 - t0) / dropped
+                        drops_left = g["cards_remaining"]
+                        self._status.eta_sec = drops_left * secs_per_drop if drops_left > 0 else 0.0
+                    else:
+                        self._status.eta_sec = -1.0
+                else:
+                    self._status.eta_sec = -1.0
                 self._emit()
 
                 if self._has_cookies() and (now - last_poll - paused_since_poll) >= poll_sec:
@@ -994,6 +1023,7 @@ class IdleController:
                         break
                     elif drops > 0:
                         self._log(f"{g['name']}: {drops} drop(s) still remaining.")
+                        _eta_samples.append((elapsed_sec, drops))
                     self._status.drops_checked = False
 
             self._stop_idle(app_id)
@@ -1035,7 +1065,7 @@ class IdleController:
             self._log("Fast cycle: no games need cards.")
             return
 
-        cycle_minutes = float(self.config.get("fast_cycle_seconds", 1800.0)) / 60
+        cycle_minutes = float(self.config.get("fast_cycle_seconds", 300.0)) / 60
         poll_sec      = max(1.0, float(self.config.get("phase2_poll_seconds", PHASE2_CARD_POLL_MIN * 60)))
 
         self._log(
@@ -1144,7 +1174,7 @@ class IdleController:
                 self._run_fast_cycle()
             else:
                 # Default: "multi" - run everything simultaneously forever
-                self._run_phase1()   # threshold=0 means infinite multi-idle
+                self._run_phase1(force_infinite=True)
 
             if not self._stop.is_set():
                 self._status.phase       = "All done"
@@ -1199,13 +1229,14 @@ _WORD_BOUNDARY_RE = re.compile(r"\s*\S+\s*$")   # trailing run of non-space + it
 _WORD_FORWARD_RE  = re.compile(r"^\s*\S+\s*")   # leading run of non-space + its trailing whitespace
 
 
-def bind_word_delete(entry: tk.Entry) -> None:
+def bind_entry_keys(entry: tk.Entry, on_escape=None, on_enter=None) -> None:
     """
-    Add Ctrl+Backspace (delete previous word) and Ctrl+Delete (delete next
-    word) to a Tk Entry widget. Stock Tk's default Entry bindings don't
-    include this (only plain Backspace/Delete and Control-h/Control-d for
-    single characters), so every text field needs it added explicitly to get
-    the word-delete behaviour people expect from other apps.
+    Attach a complete set of expected keyboard behaviours to a Tk Entry widget:
+    - Ctrl+Backspace / Ctrl+Delete: delete previous/next word
+    - Ctrl+A: select all
+    - Right-click: cut/copy/paste/select-all context menu
+    - Escape: clear selection and unfocus (calls on_escape if provided, else focus_set on parent)
+    - Return/KP_Enter: unfocus (calls on_enter if provided, same fallback)
     """
     def _delete_word_back(event):
         if entry.selection_present():
@@ -1229,8 +1260,49 @@ def bind_word_delete(entry: tk.Entry) -> None:
         entry.delete(pos, end)
         return "break"
 
+    def _select_all(event):
+        entry.select_range(0, "end")
+        entry.icursor("end")
+        return "break"
+
+    def _do_unfocus(callback):
+        try:
+            entry.select_clear()
+        except Exception:
+            pass
+        if callback:
+            callback()
+        else:
+            try:
+                entry.winfo_toplevel().focus_set()
+            except Exception:
+                pass
+
+    def _make_menu(event):
+        m = tk.Menu(entry, tearoff=0, bg=BTN_BG, fg=FG,
+                    activebackground=ACCENT, activeforeground="#fff",
+                    relief="flat", bd=0)
+        m.add_command(label="Cut",        command=lambda: entry.event_generate("<<Cut>>"))
+        m.add_command(label="Copy",       command=lambda: entry.event_generate("<<Copy>>"))
+        m.add_command(label="Paste",      command=lambda: entry.event_generate("<<Paste>>"))
+        m.add_separator()
+        m.add_command(label="Select All", command=lambda: (_select_all(None),))
+        m.tk_popup(event.x_root, event.y_root)
+
     entry.bind("<Control-BackSpace>", _delete_word_back)
     entry.bind("<Control-Delete>",    _delete_word_forward)
+    entry.bind("<Control-a>",         _select_all)
+    entry.bind("<Control-A>",         _select_all)
+    entry.bind("<Button-3>",          _make_menu)
+    entry.bind("<Escape>",            lambda e: (_do_unfocus(on_escape), "break")[1])
+    entry.bind("<Return>",            lambda e: (_do_unfocus(on_enter),  "break")[1])
+    entry.bind("<KP_Enter>",          lambda e: (_do_unfocus(on_enter),  "break")[1])
+
+
+# Keep the old name as an alias so call sites that haven't been updated yet still work.
+def bind_word_delete(entry: tk.Entry) -> None:
+    bind_entry_keys(entry)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1340,7 +1412,14 @@ class SettingsDialog(tk.Toplevel):
         self._hide_vars: dict[str, tk.BooleanVar] = {}
         self._build()
         self.transient(parent)
+        self.bind("<Button-1>", self._maybe_unfocus_on_click)
+        self.bind("<Escape>",   lambda e: self.focus_set())
         self.wait_window()
+
+    def _maybe_unfocus_on_click(self, event):
+        if isinstance(event.widget, tk.Entry):
+            return
+        self.focus_set()
 
     def _build(self):
         self.columnconfigure(0, weight=1)
@@ -1369,21 +1448,7 @@ class SettingsDialog(tk.Toplevel):
                              relief="flat", insertbackground=FG, width=28, show=initial_show,
                              exportselection=True)
             entry.pack(side="left")
-            def _make_menu(e):
-                m = tk.Menu(entry, tearoff=0, bg=BTN_BG, fg=FG,
-                            activebackground=ACCENT, activeforeground="#fff",
-                            relief="flat", bd=0)
-                m.add_command(label="Cut",        command=lambda: entry.event_generate("<<Cut>>"))
-                m.add_command(label="Copy",       command=lambda: entry.event_generate("<<Copy>>"))
-                m.add_command(label="Paste",      command=lambda: entry.event_generate("<<Paste>>"))
-                m.add_separator()
-                m.add_command(label="Select All", command=lambda: (entry.select_range(0, "end"), entry.focus_set()))
-                m.post(e.x_root, e.y_root)
-            entry.bind("<Button-3>", _make_menu)
-            entry.bind("<Control-a>", lambda e: (entry.select_range(0, "end"), "break"))
-            entry.bind("<Control-A>", lambda e: (entry.select_range(0, "end"), "break"))
-            entry.bind("<Escape>", lambda e: self.focus_set())
-            bind_word_delete(entry)
+            bind_entry_keys(entry, on_escape=lambda: self.focus_set())
             if hideable:
                 hide_var = tk.BooleanVar(value=self._cfg.get(hideable, True))
                 self._hide_vars[hideable] = hide_var
@@ -1472,8 +1537,10 @@ class SettingsDialog(tk.Toplevel):
             tk.Label(f, text=label, bg=BG, fg=FG, font=FONT).pack(anchor="w", pady=(6, 1))
             inner = tk.Frame(f, bg=BG)
             inner.pack(anchor="w")
-            tk.Entry(inner, textvariable=val_var, bg=ENTRY_BG, fg=FG, font=FONT,
-                     relief="flat", insertbackground=FG, width=6).pack(side="left")
+            e = tk.Entry(inner, textvariable=val_var, bg=ENTRY_BG, fg=FG, font=FONT,
+                         relief="flat", insertbackground=FG, width=6)
+            e.pack(side="left")
+            bind_entry_keys(e, on_escape=lambda: self.focus_set())
             ttk.Combobox(inner, textvariable=unit_var, values=units,
                          state="readonly", width=8, font=FONT).pack(side="left", padx=(4, 0))
             if hint:
@@ -1496,7 +1563,7 @@ class SettingsDialog(tk.Toplevel):
                                     self._poll_val_var, self._poll_unit_var,
                                     ["seconds", "minutes", "hours"], "(requires cookies)")
 
-        cycle_sec = float(self._cfg.get("fast_cycle_seconds", 1800.0))
+        cycle_sec = float(self._cfg.get("fast_cycle_seconds", 300.0))
         cu, cv = _sec_to_display(cycle_sec)
         self._cycle_val_var  = tk.StringVar(value=str(cv))
         self._cycle_unit_var = tk.StringVar(value=cu)
@@ -1528,7 +1595,20 @@ class SettingsDialog(tk.Toplevel):
         tk.Checkbutton(right, text="Auto-remove games once all cards are dropped",
                        variable=self._auto_remove_var,
                        bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG,
-                       font=FONT).pack(anchor="w")
+                       font=FONT).pack(anchor="w", pady=(0, 4))
+
+        self._auto_start_var = tk.BooleanVar(value=self._cfg.get("auto_start_idling", False))
+        tk.Checkbutton(right, text="Start idling automatically on launch",
+                       variable=self._auto_start_var,
+                       bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG,
+                       font=FONT).pack(anchor="w", pady=(0, 4))
+
+        self._tray_var = tk.BooleanVar(value=self._cfg.get("minimize_to_tray", False))
+        tray_cb = tk.Checkbutton(right, text="Minimize to system tray instead of closing\n(requires pystray + Pillow)",
+                                 variable=self._tray_var,
+                                 bg=BG, fg=FG, selectcolor=BTN_BG, activebackground=BG,
+                                 font=FONT, justify="left")
+        tray_cb.pack(anchor="w")
 
         # ── Bottom bar: Save / Cancel ────────────────────────────────────────
         sep = tk.Frame(self, bg=GREY, height=1)
@@ -1594,6 +1674,8 @@ class SettingsDialog(tk.Toplevel):
             "fast_cycle_stop_pause_seconds": pause_sec,
             "merge_refresh_buttons":         self._merge_refresh_var.get(),
             "auto_remove_completed":         self._auto_remove_var.get(),
+            "auto_start_idling":             self._auto_start_var.get(),
+            "minimize_to_tray":              self._tray_var.get(),
             "hide_api_key":                  self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
             "hide_login_secure":             self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
         }
@@ -1892,7 +1974,7 @@ class _CellEditor(tk.Entry):
         self.bind("<KP_Enter>",  self._commit)
         self.bind("<Escape>",    lambda e: self.destroy())
         self.bind("<FocusOut>",  self._commit)
-        bind_word_delete(self)
+        bind_entry_keys(self)
 
     def _commit(self, event=None):
         val = self.get()
@@ -1929,8 +2011,10 @@ class StatusPanel(tk.Frame):
         self._lbl(1, 2, "Next drop check", fg=GREY, font=SMALL)
         self._check_val   = self._lbl(1, 3, font=MONO)
 
-        self._lbl(2, 0, "Running (Phase 1)", fg=GREY, font=SMALL)
-        self._p1list_val  = self._lbl(2, 1, font=SMALL, columnspan=3)
+        self._lbl(2, 0, "ETA (this game)", fg=GREY, font=SMALL)
+        self._eta_val     = self._lbl(2, 1, font=MONO)
+        self._lbl(2, 2, "Running (Phase 1)", fg=GREY, font=SMALL)
+        self._p1list_val  = self._lbl(2, 3, font=SMALL)
 
         self._crash_val = self._lbl(3, 0, fg=WARN, font=SMALL, columnspan=4)
 
@@ -1940,6 +2024,7 @@ class StatusPanel(tk.Frame):
             self._game_val.config(text="")
             self._elapsed_val.config(text="")
             self._check_val.config(text="")
+            self._eta_val.config(text="")
             self._p1list_val.config(text="")
             self._crash_val.config(text="")
             return
@@ -1955,10 +2040,15 @@ class StatusPanel(tk.Frame):
                 self._check_val.config(text=_fmt_time(st.next_check_sec))
             else:
                 self._check_val.config(text="n/a (no cookies)")
+            if st.eta_sec >= 0:
+                self._eta_val.config(text=_fmt_time(st.eta_sec))
+            else:
+                self._eta_val.config(text="estimating..." if st.elapsed_sec > 0 else "")
         else:
             self._game_val.config(text="")
             self._elapsed_val.config(text="")
             self._check_val.config(text="")
+            self._eta_val.config(text="")
 
         if st.phase1_running:
             names = ", ".join(st.phase1_running[:5])
@@ -2147,12 +2237,11 @@ class App(tk.Tk):
         self._thread: threading.Thread | None   = None
         self._running = False
         self._drag_item: str | None = None
-        self._last_removed: tuple | None = None
         self._resumed_before = False
-        self._sort_col: str = "order"   # column currently sorted by
-        self._sort_desc: bool = False   # False = ascending
-        self._undo_stack: list[list[dict]] = []   # snapshots of self.games before each mutation
-        self._redo_stack: list[list[dict]] = []   # snapshots popped by undo, replayable with Ctrl+Y
+        self._sort_col: str = "order"
+        self._sort_desc: bool = False
+        self._undo_stack: list[list[dict]] = []
+        self._redo_stack: list[list[dict]] = []
         self._undo_limit = 50
 
         # Thread-safe hand-off from background threads (IdleController's
@@ -2202,6 +2291,12 @@ class App(tk.Tk):
                 self._append_log(f"WARNING: {warning}")
                 self.after(200, lambda w=warning: messagebox.showwarning("Data file issue", w))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._tray_icon = None
+
+        # Auto-start: begin idling immediately after a short delay so the UI
+        # has time to finish rendering before the controller thread starts.
+        if self.config.get("auto_start_idling", False) and self.games and SAM_GAME_EXE.exists():
+            self.after(800, self._start_idling)
 
     # -----------------------------------------------------------------------
     # Properties
@@ -2242,7 +2337,7 @@ class App(tk.Tk):
         self._mk_btn(tb_left_row1, "Import from Steam", self._import_library, accent=True).pack(side="left", padx=(0, 6))
         self._mk_btn(tb_left_row1, "Add via App ID",    self._add_by_id).pack(side="left", padx=(0, 6))
         self._mk_btn(tb_left_row1, "Remove",            self._remove_game).pack(side="left", padx=(0, 6))
-        self._undo_btn = self._mk_btn(tb_left_row1, "Undo Remove", self._undo_remove)
+        self._undo_btn = self._mk_btn(tb_left_row1, "Undo", self._undo)
         self._undo_btn.pack(side="left")
         self._undo_btn.config(state="disabled")
 
@@ -2282,7 +2377,7 @@ class App(tk.Tk):
             insertbackground=FG, width=28,
         )
         search_entry.pack(side="left", padx=(6, 0))
-        bind_word_delete(search_entry)
+        bind_entry_keys(search_entry)
         self._search_count_lbl = tk.Label(search_frame, text="", bg=BG, fg=GREY, font=SMALL)
         self._search_count_lbl.pack(side="left", padx=(6, 0))
         self._mk_btn(search_frame, "Clear", lambda: self._search_var.set("")).pack(side="left", padx=(4, 0))
@@ -2372,11 +2467,11 @@ class App(tk.Tk):
         self._log_text = tk.Text(
             log_frame, height=10,
             bg=ENTRY_BG, fg=FG, font=MONO, relief="flat", wrap="word", bd=0,
-            state="normal",   # keep normal so user can select/copy
+            state="disabled",
         )
-        # Make it read-only to typing but still selectable
-        self._log_text.bind("<Key>", lambda e: "break" if e.keysym not in (
-            "c", "C", "a", "A") and e.state & 0x4 == 0 else None)
+        # Selectable but read-only: re-enable Ctrl+A and Ctrl+C through the disabled state
+        self._log_text.bind("<Control-a>", lambda e: (self._log_text.tag_add("sel", "1.0", "end"), "break"))
+        self._log_text.bind("<Control-A>", lambda e: (self._log_text.tag_add("sel", "1.0", "end"), "break"))
         log_vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self._log_text.yview)
         self._log_text.configure(yscrollcommand=log_vsb.set)
         self._log_text.pack(side="left", fill="both", expand=True)
@@ -2489,22 +2584,16 @@ class App(tk.Tk):
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self._undo_limit:
             self._undo_stack.pop(0)
-        # A fresh action invalidates whatever redo history existed --
-        # otherwise redoing after a new edit could jump to a state that no
-        # longer makes sense next to what was just done.
         self._redo_stack.clear()
+        self._undo_btn.config(state="normal")
 
     def _on_ctrl_z(self, event=None):
-        # Don't hijack Ctrl+Z while the user is editing text somewhere
-        # (an open cell editor, the search box, a settings field, etc.) --
-        # let the widget's own native undo/typing behaviour happen instead.
         focused = self.focus_get()
         if isinstance(focused, (tk.Entry, tk.Spinbox, ttk.Entry, ttk.Combobox, tk.Text)):
             return
         self._undo()
 
     def _on_ctrl_y(self, event=None):
-        # Same guard as Ctrl+Z: don't hijack Ctrl+Y while typing.
         focused = self.focus_get()
         if isinstance(focused, (tk.Entry, tk.Spinbox, ttk.Entry, ttk.Combobox, tk.Text)):
             return
@@ -2519,6 +2608,7 @@ class App(tk.Tk):
         save_games(self.games)
         self._refresh_table()
         self._append_log("Undid last change.")
+        self._undo_btn.config(state="normal" if self._undo_stack else "disabled")
 
     def _redo(self):
         if not self._redo_stack:
@@ -2529,6 +2619,7 @@ class App(tk.Tk):
         save_games(self.games)
         self._refresh_table()
         self._append_log("Redid last undone change.")
+        self._undo_btn.config(state="normal")
 
     def _on_delete_key(self, event=None):
         # Don't hijack Delete/Backspace while typing in a text entry --
@@ -3019,8 +3110,6 @@ class App(tk.Tk):
         indices_sorted = sorted(indices, reverse=True)
         for idx in indices_sorted:
             self.games.pop(idx)
-        self._last_removed = None
-        self._undo_btn.config(state="disabled")
         save_games(self.games)
         self._refresh_table()
         self._append_log(f"Removed {len(indices)} game(s).")
@@ -3137,8 +3226,10 @@ class App(tk.Tk):
     def _append_log(self, msg: str):
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
+        self._log_text.config(state="normal")
         self._log_text.insert("end", line + "\n")
         self._log_text.see("end")
+        self._log_text.config(state="disabled")
 
     def _log_from_thread(self, msg: str):
         self._dispatch(self._append_log, msg)
@@ -3235,9 +3326,14 @@ class App(tk.Tk):
 
     def _force_kill_all(self):
         import subprocess as sp
+        import platform as _platform
         try:
-            sp.run(["taskkill", "/F", "/IM", "SAM.Game.exe"],
-                   stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            if _platform.system() == "Windows":
+                sp.run(["taskkill", "/F", "/IM", "SAM.Game.exe"],
+                       stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            else:
+                sp.run(["pkill", "-f", "SAM.Game.exe"],
+                       stdout=sp.DEVNULL, stderr=sp.DEVNULL)
             self._append_log("Force killed all SAM.Game.exe processes.")
         except Exception as exc:
             self._append_log(f"Force kill failed: {exc}")
@@ -3257,8 +3353,6 @@ class App(tk.Tk):
         # IdleController, which holds a reference to this same list object,
         # sees the removal too instead of keeping a stale copy around.
         self.games[:] = [g for g in self.games if not g["cards_done"]]
-        self._last_removed = None
-        self._undo_btn.config(state="disabled")
         save_games(self.games)
         self._refresh_table()
         self._append_log(f"Removed {len(completed)} completed game(s).")
@@ -3425,23 +3519,13 @@ class App(tk.Tk):
             return
         self._push_undo()
         g = self.games.pop(idx)
-        self._last_removed = (idx, g)
         save_games(self.games)
         self._refresh_table()
-        self._append_log(f"Removed {g['name']} ({g['app_id']}). Click Undo Remove to bring it back.")
-        self._undo_btn.config(state="normal")
+        self._append_log(f"Removed {g['name']} ({g['app_id']}). Press Ctrl+Z or click Undo to bring it back.")
 
     def _undo_remove(self):
-        if not self._last_removed:
-            return
-        idx, g = self._last_removed
-        idx = max(0, min(idx, len(self.games)))
-        self.games.insert(idx, g)
-        self._last_removed = None
-        save_games(self.games)
-        self._refresh_table()
-        self._append_log(f"Restored {g['name']} ({g['app_id']}).")
-        self._undo_btn.config(state="disabled")
+        # Legacy method kept so any serialised calls don't break; just delegates.
+        self._undo()
 
     def _remove_all(self):
         if not self.games:
@@ -3455,8 +3539,6 @@ class App(tk.Tk):
         self._push_undo()
         count = len(self.games)
         self.games.clear()
-        self._last_removed = None
-        self._undo_btn.config(state="disabled")
         save_games(self.games)
         self._refresh_table()
         self._append_log(f"Removed all {count} game(s).")
@@ -3473,7 +3555,6 @@ class App(tk.Tk):
         self.games.clear()
         self._undo_stack.clear()
         self._redo_stack.clear()
-        self._last_removed = None
         self._undo_btn.config(state="disabled")
         # Wipe both data files from disk
         for path in (DATA_FILE, CONFIG_FILE):
@@ -3740,10 +3821,87 @@ class App(tk.Tk):
             self._append_log("Cards dropped confirmed manually.")
 
     # -----------------------------------------------------------------------
+    # System tray
+    # -----------------------------------------------------------------------
+
+    def _try_build_tray(self):
+        """
+        Build a pystray system-tray icon. Returns True on success.
+        Fails gracefully if pystray or Pillow are not installed.
+        """
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+        except ImportError:
+            return False
+
+        # Build a simple 64x64 dark icon with an "S" letter.
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([2, 2, size - 2, size - 2], fill="#3a7ebf")
+        draw.text((18, 14), "S", fill="#ffffff")
+
+        def _on_restore(icon, item):
+            self._tray_restore()
+
+        def _on_quit(icon, item):
+            self._tray_quit()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show / Restore", _on_restore, default=True),
+            pystray.MenuItem("Quit", _on_quit),
+        )
+        self._tray_icon = pystray.Icon("SAM Idler", img, "SAM Idler", menu)
+        threading.Thread(target=self._tray_icon.run, daemon=True).start()
+        return True
+
+    def _tray_restore(self):
+        """Called from the tray menu to bring the window back."""
+        self.after(0, self._do_restore)
+
+    def _do_restore(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
+
+    def _tray_quit(self):
+        """Called from tray 'Quit' menu item."""
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
+        self.after(0, self._do_quit)
+
+    def _do_quit(self):
+        if self._running:
+            self._stop_idling()
+        self.destroy()
+
+    # -----------------------------------------------------------------------
     # Close
     # -----------------------------------------------------------------------
 
     def _on_close(self):
+        if self.config.get("minimize_to_tray", False):
+            # Try to hide to tray; only prompt/quit if tray setup fails.
+            if self._try_build_tray():
+                self.withdraw()
+                return
+            # pystray not available: fall through to normal quit behaviour
+            # but warn once so the user knows why.
+            self._append_log(
+                "Minimize to tray is enabled but pystray or Pillow is not installed. "
+                "Install them with: pip install pystray pillow"
+            )
         if self._running:
             if not messagebox.askyesno(
                 "Quit",

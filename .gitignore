@@ -28,6 +28,11 @@ __pycache__/
 venv/
 env/
 
+# PyInstaller output
+dist/
+build/
+*.spec
+
 # IDEs
 .vscode/
 .idea/

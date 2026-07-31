@@ -4,11 +4,11 @@ A Python/Tkinter GUI for farming Steam trading cards using `SAM.Game.exe` as the
 
 ## How card drops work
 
-Cards drop while a game is running. Steam tracks how long a game has been open and delivers drops on a timer, roughly every 30 minutes per card by default (developers can set a different interval). The drop lands in your inventory while the session is still active — you do not need to close the game to receive it.
+Cards drop while a game is running. Steam tracks how long a game has been open and delivers drops on a timer, roughly every 30 minutes per card by default (developers can set a different interval). The drop lands in your inventory while the session is still active - you do not need to close the game to receive it.
 
-**Running multiple games at once slows the drop rate per game.** Steam intentionally reduces drop frequency when more than one game is running. The exact amount varies but is significant — two games running simultaneously does not mean two cards arriving twice as fast, it means each card takes considerably longer to arrive.
+**Running multiple games at once slows the drop rate per game.** Steam intentionally reduces drop frequency when more than one game is running. The exact amount varies but is significant - two games running simultaneously does not mean two cards arriving twice as fast, it means each card takes considerably longer to arrive.
 
-**Some accounts have a drop delay.** If your account is new or has made a refund request recently, Steam adds a delay before drops start — typically around 2 hours of playtime per game. This is a refund-abuse prevention measure. On an established account with no recent refunds, drops can start within the first session with no specific playtime requirement.
+**Some accounts have a drop delay.** If your account is new or has made a refund request recently, Steam adds a delay before drops start - typically around 2 hours of playtime per game. This is a refund-abuse prevention measure. On an established account with no recent refunds, drops can start within the first session with no specific playtime requirement.
 
 ## Idle modes
 
@@ -20,7 +20,7 @@ Starts all games simultaneously and keeps them running indefinitely. Because eve
 
 ### Solo
 
-Idles one game at a time in list order. Each game gets the full drop rate since nothing else is competing. Requires session cookies for automatic detection — the app checks drop counts every few minutes and moves to the next game automatically when a game hits 0. Without cookies, use the "Cards Dropped (manual)" button to advance manually.
+Idles one game at a time in list order. Each game gets the full drop rate since nothing else is competing. Requires session cookies for automatic detection - the app checks drop counts every few minutes and moves to the next game automatically when a game hits 0. Without cookies, use the "Cards Dropped (manual)" button to advance manually.
 
 ### Multi then solo
 
@@ -32,9 +32,15 @@ Runs all games simultaneously for a set interval, then rapidly stops and restart
 
 ## Requirements
 
-- Python 3.8+, no third-party packages
+- Python 3.10+
 - `SAM.Game.exe` and `SAM.API.dll` from a SAM release (see setup)
 - Steam running and logged in
+
+Optional, for system tray support:
+
+```
+pip install pystray pillow
+```
 
 ## Setup
 
@@ -75,7 +81,7 @@ Open **Settings** on the right side of the toolbar.
 - Without cookies the app cannot detect drops automatically. Use "Cards Dropped (manual)" instead.
 - You do not need to keep the browser tab open. Cookies persist independently of open tabs.
 
-The API key and `steamLoginSecure` fields have a **Hide** checkbox (on by default, state persists). All text fields support Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+Backspace/Delete, and right-click for a cut/copy/paste menu.
+All text fields support Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+Backspace/Delete, and right-click for a cut/copy/paste menu. The API key and `steamLoginSecure` fields have a **Hide** checkbox (on by default, state persists).
 
 **Display and behaviour**
 - **Playtime unit** - minutes (default), hours, seconds, or days. Takes effect immediately everywhere.
@@ -86,6 +92,8 @@ The API key and `steamLoginSecure` fields have a **Hide** checkbox (on by defaul
 - **Pause after stopping each game for** - shown for "fast cycle" only. How long to wait after stopping each game before checking drops and restarting it. Default 5 seconds. Lower values may cause Steam to not register the session end in time.
 - **Merge Refresh buttons** - combine Refresh Drops and Refresh Playtimes into a single Refresh button.
 - **Auto-remove completed** - automatically remove a game from the list once all its cards are dropped.
+- **Start idling automatically on launch** - begin idling immediately when the app opens, without needing to click Start Idling.
+- **Minimize to system tray instead of closing** - clicking the window's close button hides it to the system tray and keeps the idler running. Right-click the tray icon to restore or quit. Requires `pystray` and `Pillow` (see Requirements).
 
 ## Adding games
 
@@ -158,7 +166,7 @@ Sorting by any column other than `#` is view-only and does not affect idle order
 
 ## Status panel and log
 
-The status panel shows the current mode and game being idled, how long it has been running, and when the next drop check fires.
+The status panel shows the current mode and game being idled, how long it has been running, the estimated time remaining for the current game (solo mode only, requires at least two drop confirmations to calculate), and when the next drop check fires.
 
 The summary bar above the table shows stats relevant to the current idle mode. In multi then solo mode it shows total drops left, multi-idle time remaining, how many games are not yet solo-ready, solo queue size, and done count. In multi or fast cycle mode the solo-ready columns are hidden since they don't apply. In solo mode only total drops left and done are shown.
 
@@ -168,7 +176,7 @@ The log records every event with a full timestamp. You can select and copy text 
 
 ## Pausing and resuming
 
-**Pause** stops all idle processes but saves progress. **Resume Idling** picks up where it left off and re-checks drops and playtimes first. Closing while running prompts you to pause first.
+**Pause** stops all idle processes but saves progress. **Resume Idling** picks up where it left off and re-checks drops and playtimes first. Closing while running (without tray mode) prompts you to pause first.
 
 ## Toolbar
 
@@ -179,7 +187,7 @@ The log records every event with a full timestamp. You can select and copy text 
 | **Import from Steam** | Fetch your full library with playtime and drop counts |
 | **Add via App ID** | Manually add a game by Steam App ID |
 | **Remove** | Remove the selected game |
-| **Undo Remove** | Restore the last removed game - Ctrl+Z also works and covers edits, toggles, and reordering |
+| **Undo** | Undo the last change (same as Ctrl+Z) - covers edits, toggles, reordering, and removals |
 
 **Left block, row 2**
 
@@ -219,10 +227,14 @@ Most likely your session cookies have expired. Re-enter `sessionid` and `steamLo
 
 If it still does not work after fresh cookies, set the environment variable `SAM_IDLER_DEBUG_HTML=1` before launching; the raw page HTML is saved to `debug_html/` for inspection.
 
+```
+SAM_IDLER_DEBUG_HTML=1 python SAM_idler.py
+```
+
 ## VAC and anti-cheat
 
 When the app starts or you import games, it checks each game's VAC status via the Steam store API and shows the result in the VAC column (`yes` / `no` / `?`). If any VAC-enabled games are in your list when you click Start Idling, you will be asked to confirm before the session starts.
 
 The risk is not from idling itself. It comes from running the idler while you are actively connected to a VAC-secured server on the same machine. If VAC scans while SAM.Game.exe is open alongside a VAC-protected game session, it could flag it. Pause the idler before launching any VAC-protected multiplayer game.
 
-**Rust specifically:** Rust shows as VAC-enabled on its Steam store page but uses Easy Anti-Cheat (EAC) in practice and issues game bans, not VAC bans. The VAC label on Rust's store page is a legacy listing. EAC is a separate system — idling Rust while actively playing it is still worth avoiding out of caution, but it is not a VAC concern.
+**Rust specifically:** Rust shows as VAC-enabled on its Steam store page but uses Easy Anti-Cheat (EAC) in practice and issues game bans, not VAC bans. The VAC label on Rust's store page is a legacy listing. EAC is a separate system - idling Rust while actively playing it is still worth avoiding out of caution, but it is not a VAC concern.
