@@ -2861,11 +2861,16 @@ class App(tk.Tk):
 
     def _games_snapshot_hash(self) -> int:
         """Cheap hash of the game list state for dirty detection."""
-        return hash(tuple(
-            (g["app_id"], g["name"], g["playtime_hours"],
-             g["cards_remaining"], g["phase1_done"],
-             g["cards_done"], g.get("vac_enabled"))
-            for g in self.games
+        return hash((
+            self._sort_col,
+            self._sort_desc,
+            self._search_var.get() if hasattr(self, "_search_var") else "",
+            tuple(
+                (g["app_id"], g["name"], g["playtime_hours"],
+                 g["cards_remaining"], g["phase1_done"],
+                 g["cards_done"], g.get("vac_enabled"))
+                for g in self.games
+            )
         ))
 
     def _refresh_table(self, force: bool = False):
