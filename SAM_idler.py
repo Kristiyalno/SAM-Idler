@@ -2736,12 +2736,11 @@ class App(tk.Tk):
 
     def _apply_cards_btn_visibility(self):
         show = self.config.get("show_cards_manual_btn", False)
+        self._cards_btn.pack_forget()
+        self._cards_hint.pack_forget()
         if show:
-            self._cards_btn.pack(side="left", padx=(0, 6), before=self._cards_hint)
+            self._cards_btn.pack(side="left", padx=(0, 6))
             self._cards_hint.pack(side="left", padx=4)
-        else:
-            self._cards_btn.pack_forget()
-            self._cards_hint.pack_forget()
 
     def _on_unit_change(self, *_):
         self.config["playtime_unit"] = self._unit
@@ -3699,6 +3698,7 @@ class App(tk.Tk):
         self._unit_var.set(self.config.get("playtime_unit", "minutes"))
         self._apply_refresh_button_mode()
         self._update_cards_hint()
+        self._apply_cards_btn_visibility()
         self._refresh_table()
         self._append_log("Full reset: all data and settings cleared.")
 
