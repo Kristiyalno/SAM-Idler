@@ -36,11 +36,13 @@ Runs all games simultaneously for a set interval, then rapidly stops and restart
 - `SAM.Game.exe` and `SAM.API.dll` from a SAM release (see setup)
 - Steam running and logged in
 
-Optional, for system tray support:
+Optional — install both together for system tray support and the window icon:
 
 ```
 pip install pystray pillow
 ```
+
+The Python console window is automatically hidden on Windows when the app starts. If you need to see debug output, run from a terminal directly and it will stay visible.
 
 ## Setup
 
@@ -94,6 +96,9 @@ All text fields support Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+Backspace/Delete, and right
 - **Auto-remove completed** - automatically remove a game from the list once all its cards are dropped.
 - **Start idling automatically on launch** - begin idling immediately when the app opens, without needing to click Start Idling.
 - **Minimize to system tray instead of closing** - clicking the window's close button hides it to the system tray and keeps the idler running. Right-click the tray icon to restore or quit. Requires `pystray` and `Pillow` (see Requirements).
+
+**Legacy**
+- **Show "Cards Dropped (manual)" button** - hidden by default. Only useful if you never set session cookies and need to manually advance solo mode. If you have cookies set, the app detects drops automatically and this button does nothing useful.
 
 ## Adding games
 
@@ -213,7 +218,7 @@ The log records every event with a full timestamp. You can select and copy text 
 |---|---|
 | **Start Idling** / **Resume Idling** | Start or resume - automatically refreshes drops and playtimes first (skipped silently if credentials are not set) |
 | **Pause** | Stop all idle processes and save progress |
-| **Cards Dropped (manual)** | Advance solo mode without waiting for auto-detection (use when cookies are not set) |
+| **Cards Dropped (manual)** | Advance solo mode without waiting for auto-detection. Hidden by default - enable in Settings under Legacy. Only useful if you have no session cookies set. |
 
 ## Notes
 

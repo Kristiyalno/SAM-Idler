@@ -167,6 +167,7 @@ _DEFAULT_CONFIG = {
     "auto_remove_completed": False,
     "minimize_to_tray": False,
     "auto_start_idling": False,
+    "show_cards_manual_btn": False,
 }
 
 
@@ -297,6 +298,7 @@ def default_game(app_id: str, name: str = "", playtime_h: float = 0.0, cards_rem
         "cards_remaining": cards_remaining,
         "phase1_done": True,
         "cards_done": (cards_remaining == 0),
+        "vac_enabled": None,
     }
 
 
@@ -641,6 +643,7 @@ class IdleStatus:
         self.next_check_sec: float = 0.0
         self.eta_sec: float = -1.0   # -1 means unknown; >= 0 is estimated seconds until game is done
         self.drops_checked: bool = False
+        self.has_cookies: bool = False
         self.crash_notice: str = ""
         self.paused: bool = False
 
@@ -677,6 +680,7 @@ class IdleController:
         self._procs.clear()
 
     def _emit(self):
+        self._status.has_cookies = self._has_cookies()
         self.on_status(self._status)
 
     def _log(self, msg: str):
@@ -748,7 +752,7 @@ class IdleController:
         infinite    = force_infinite or threshold_h <= 0.0
 
         if infinite:
-            targets = list(self.games)   # all games, never stop by time
+            targets = [g for g in self.games if not g["cards_done"]]
         else:
             targets = [g for g in self.games if not g["phase1_done"]]
 
@@ -840,7 +844,6 @@ class IdleController:
                         g["phase1_done"] = True
                         self._stop_idle(app_id)
                         self._log(f"{g['name']} reached {threshold_h}h mark, stopping.")
-                        save_games(self.games)
                         self.on_update()
                         continue
                     still_going.append((g, elapsed_h, needed_h))
@@ -851,6 +854,20 @@ class IdleController:
 
             if not still_going and not infinite:
                 break
+
+            # In infinite mode, populate active_game with a summary so the
+            # status panel doesn't show a blank "Currently idling" row.
+            if infinite:
+                count = len(still_going)
+                self._status.active_game = f"{count} game{'s' if count != 1 else ''} running"
+                self._status.active_app_id = ""
+                # elapsed_sec: use the longest elapsed time across all games
+                elapsed_values = [eh * 3600 for _, eh, _ in still_going if eh is not None]
+                self._status.elapsed_sec = max(elapsed_values) if elapsed_values else 0.0
+            else:
+                self._status.active_game   = ""
+                self._status.active_app_id = ""
+                self._status.elapsed_sec   = 0.0
 
             # Time remaining = the LONGEST individual wait (bottleneck game)
             # since all games run simultaneously — sum is wrong.
@@ -865,14 +882,12 @@ class IdleController:
                 self._status.next_check_sec = 0.0
 
             self._emit()
-            self.on_update()
             self._stop.wait(1)   # 1-second tick so summary bar counts down live
 
         self._status.phase1_running = []
         if not infinite:
             self._log("Phase 1 complete.")
         save_games(self.games)
-        self.on_update()
 
     # Phase 2 ---------------------------------------------------------------
 
@@ -896,18 +911,17 @@ class IdleController:
             self._status.active_game   = g["name"]
             self._status.active_app_id = app_id
             self._status.elapsed_sec   = 0.0
+            self._status.eta_sec       = -1.0
             self._status.drops_checked = False
             self._status.crash_notice  = ""
 
             if self._has_cookies():
                 drops = self._check_drops(app_id)
                 g["cards_remaining"] = drops
-                save_games(self.games)
                 self.on_update()
                 if drops == 0:
                     self._log(f"{g['name']}: 0 drops remaining, skipping.")
                     g["cards_done"] = True
-                    save_games(self.games)
                     self.on_update()
                     continue
                 self._log(
@@ -915,7 +929,14 @@ class IdleController:
                     f"{drops if drops >= 0 else '?'} drop(s) remaining."
                 )
             else:
-                self._log(f"Idling {g['name']} (no cookies, drop count unknown).")
+                if g["cards_remaining"] == 0:
+                    self._log(
+                        f"WARNING: {g['name']} has cards_remaining=0 from a previous session "
+                        "but cookies are not set so this cannot be verified. "
+                        "Idling anyway - use 'Cards Dropped (manual)' to advance if it is actually done."
+                    )
+                else:
+                    self._log(f"Idling {g['name']} (no cookies, drop count unknown).")
 
             self._emit()
 
@@ -1015,7 +1036,6 @@ class IdleController:
                     drops = self._check_drops(app_id)
                     g["cards_remaining"] = drops
                     self._status.drops_checked = True
-                    save_games(self.games)
                     self.on_update()
                     if drops == 0:
                         self._log(f"{g['name']}: 0 drops remaining, moving on.")
@@ -1032,7 +1052,6 @@ class IdleController:
                 g["cards_done"]      = True
                 g["cards_remaining"] = 0
                 self._log(f"Cards done: {g['name']}.")
-                save_games(self.games)
                 self.on_update()
                 # Auto-remove if configured
                 if self.config.get("auto_remove_completed", False):
@@ -1043,7 +1062,6 @@ class IdleController:
         self._emit()
         self._log("Solo mode complete.")
         save_games(self.games)
-        self.on_update()
 
     # Fast cycle ------------------------------------------------------------
 
@@ -1082,6 +1100,8 @@ class IdleController:
             # Start all games
             self._status.phase = f"Fast cycle: multi-idling {len(targets)} game(s)"
             self._status.phase1_running = [g["name"] for g in targets]
+            self._status.active_game   = ""
+            self._status.active_app_id = ""
             self._emit()
 
             for g in targets:
@@ -1092,12 +1112,13 @@ class IdleController:
                 except Exception as exc:
                     self._log(f"ERROR starting {g['app_id']}: {exc}")
 
-            # Wait for the cycle duration
+            # Wait for the cycle duration - show countdown in next_check_sec
             wait_start = time.time()
             cycle_sec  = cycle_minutes * 60
             while not self._stop.is_set():
                 elapsed = time.time() - wait_start
-                self._status.next_check_sec = max(0.0, cycle_sec - elapsed)
+                remaining = max(0.0, cycle_sec - elapsed)
+                self._status.next_check_sec = remaining
                 self._emit()
                 if elapsed >= cycle_sec:
                     break
@@ -1128,12 +1149,10 @@ class IdleController:
                 if self._has_cookies():
                     drops = self._check_drops(app_id)
                     g["cards_remaining"] = drops
-                    save_games(self.games)
                     self.on_update()
                     if drops == 0:
                         g["cards_done"] = True
                         self._log(f"{g['name']}: 0 drops remaining, done.")
-                        save_games(self.games)
                         self.on_update()
                         if self.config.get("auto_remove_completed", False):
                             self.on_auto_remove(app_id)
@@ -1155,12 +1174,12 @@ class IdleController:
         self._emit()
         self._log("Fast cycle complete.")
         save_games(self.games)
-        self.on_update()
 
     # Entry -----------------------------------------------------------------
 
     def run(self):
         mode = self.config.get("idle_mode", "multi")
+        self._status.has_cookies = self._has_cookies()
         try:
             if mode == "solo":
                 # Solo mode: skip multi-idle entirely, just do one-at-a-time
@@ -1297,12 +1316,6 @@ def bind_entry_keys(entry: tk.Entry, on_escape=None, on_enter=None) -> None:
     entry.bind("<Escape>",            lambda e: (_do_unfocus(on_escape), "break")[1])
     entry.bind("<Return>",            lambda e: (_do_unfocus(on_enter),  "break")[1])
     entry.bind("<KP_Enter>",          lambda e: (_do_unfocus(on_enter),  "break")[1])
-
-
-# Keep the old name as an alias so call sites that haven't been updated yet still work.
-def bind_word_delete(entry: tk.Entry) -> None:
-    bind_entry_keys(entry)
-
 
 
 # ---------------------------------------------------------------------------
@@ -1610,6 +1623,16 @@ class SettingsDialog(tk.Toplevel):
                                  font=FONT, justify="left")
         tray_cb.pack(anchor="w")
 
+        # ── Legacy ────────────────────────────────────────────────────────────
+        tk.Label(right, text="Legacy", font=BOLD, bg=BG, fg=GREY).pack(anchor="w", pady=(14, 2))
+        self._cards_manual_var = tk.BooleanVar(value=self._cfg.get("show_cards_manual_btn", False))
+        tk.Checkbutton(right,
+                       text='Show "Cards Dropped (manual)" button\n'
+                            "(only needed if you never set session cookies)",
+                       variable=self._cards_manual_var,
+                       bg=BG, fg=GREY, selectcolor=BTN_BG, activebackground=BG,
+                       font=FONT, justify="left").pack(anchor="w")
+
         # ── Bottom bar: Save / Cancel ────────────────────────────────────────
         sep = tk.Frame(self, bg=GREY, height=1)
         sep.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 0))
@@ -1676,6 +1699,7 @@ class SettingsDialog(tk.Toplevel):
             "auto_remove_completed":         self._auto_remove_var.get(),
             "auto_start_idling":             self._auto_start_var.get(),
             "minimize_to_tray":              self._tray_var.get(),
+            "show_cards_manual_btn":         self._cards_manual_var.get(),
             "hide_api_key":                  self._hide_vars.get("hide_api_key",      tk.BooleanVar(value=True)).get(),
             "hide_login_secure":             self._hide_vars.get("hide_login_secure", tk.BooleanVar(value=True)).get(),
         }
@@ -1727,7 +1751,7 @@ class ImportDialog(tk.Toplevel):
                                  relief="flat", insertbackground=FG, width=22)
         filter_entry.pack(side="left", padx=(6, 0))
         filter_entry.focus_set()
-        bind_word_delete(filter_entry)
+        bind_entry_keys(filter_entry)
         self._filter_count_lbl = tk.Label(ff, text="", bg=BG, fg=GREY, font=SMALL)
         self._filter_count_lbl.pack(side="left", padx=(6, 0))
 
@@ -1970,11 +1994,8 @@ class _CellEditor(tk.Entry):
         self.select_range(0, "end")
         self.focus_set()
 
-        self.bind("<Return>",    self._commit)
-        self.bind("<KP_Enter>",  self._commit)
-        self.bind("<Escape>",    lambda e: self.destroy())
         self.bind("<FocusOut>",  self._commit)
-        bind_entry_keys(self)
+        bind_entry_keys(self, on_escape=lambda: self.destroy(), on_enter=self._commit)
 
     def _commit(self, event=None):
         val = self.get()
@@ -2038,8 +2059,12 @@ class StatusPanel(tk.Frame):
                 self._check_val.config(text="checking...")
             elif st.next_check_sec > 0:
                 self._check_val.config(text=_fmt_time(st.next_check_sec))
-            else:
+            elif st.next_check_sec < 0:
+                self._check_val.config(text="n/a (multi mode)")
+            elif not st.has_cookies:
                 self._check_val.config(text="n/a (no cookies)")
+            else:
+                self._check_val.config(text="collecting...")
             if st.eta_sec >= 0:
                 self._eta_val.config(text=_fmt_time(st.eta_sec))
             else:
@@ -2213,6 +2238,60 @@ class _WrapRow(tk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# OS / window helpers
+# ---------------------------------------------------------------------------
+
+def _hide_console():
+    """Hide the Windows console window that Python spawns for .py files.
+    Does nothing on non-Windows or when already running windowless."""
+    try:
+        import ctypes
+        import platform as _platform
+        if _platform.system() == "Windows":
+            ctypes.windll.user32.ShowWindow(
+                ctypes.windll.kernel32.GetConsoleWindow(), 0  # SW_HIDE
+            )
+    except Exception:
+        pass
+
+
+def _make_app_icon(size: int = 64):
+    """Generate a simple icon with Pillow. Returns None if Pillow isn't installed."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([2, 2, size - 2, size - 2], fill="#1a2a3a")
+    draw.ellipse([4, 4, size - 4, size - 4], outline="#3a7ebf", width=3)
+    text = "S"
+    try:
+        font = ImageFont.truetype("arial.ttf", size // 2)
+    except Exception:
+        font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1]),
+              text, fill="#3a7ebf", font=font)
+    return img
+
+
+def _set_window_icon(root: tk.Tk):
+    """Set the taskbar / wm icon. Tries Pillow first, falls back gracefully."""
+    try:
+        from PIL import ImageTk
+        img = _make_app_icon(64)
+        if img is None:
+            return
+        photo = ImageTk.PhotoImage(img)
+        root.iconphoto(True, photo)
+        root._icon_photo = photo  # type: ignore[attr-defined]  keep ref alive
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -2223,6 +2302,11 @@ class App(tk.Tk):
         self.geometry("960x900")
         self.minsize(740, 680)
         self.configure(bg=BG)
+
+        # Hide the console window on Windows.
+        _hide_console()
+        # Set the taskbar / window manager icon.
+        _set_window_icon(self)
 
         self.games, games_warning   = load_games()
         self.config, config_warning = load_config()
@@ -2243,6 +2327,8 @@ class App(tk.Tk):
         self._undo_stack: list[list[dict]] = []
         self._redo_stack: list[list[dict]] = []
         self._undo_limit = 50
+        self._games_hash: int = 0          # tracks whether table needs rebuild
+        self._save_after_id: str | None = None  # debounced save handle
 
         # Thread-safe hand-off from background threads (IdleController's
         # run loop, and the various *_fetch worker threads) to the GUI
@@ -2333,7 +2419,7 @@ class App(tk.Tk):
         tb_left_row2 = tk.Frame(tb_left, bg=BG)
         tb_left_row2.pack(fill="x", pady=(6, 0))
 
-        # Row 1: import, add, remove, undo remove
+        # Row 1: import, add, remove, undo
         self._mk_btn(tb_left_row1, "Import from Steam", self._import_library, accent=True).pack(side="left", padx=(0, 6))
         self._mk_btn(tb_left_row1, "Add via App ID",    self._add_by_id).pack(side="left", padx=(0, 6))
         self._mk_btn(tb_left_row1, "Remove",            self._remove_game).pack(side="left", padx=(0, 6))
@@ -2447,12 +2533,12 @@ class App(tk.Tk):
         self._stop_btn.config(state="disabled")
 
         self._cards_btn = self._mk_btn(ctrl, "Cards Dropped (manual)", self._mark_cards_dropped, success=True)
-        self._cards_btn.pack(side="left", padx=(0, 6))
         self._cards_btn.config(state="disabled")
-
+        # visibility is controlled by the Legacy setting; packed/forgotten in _apply_cards_btn_visibility
         self._cards_hint = tk.Label(ctrl, text="", font=SMALL, bg=BG, fg=GREY)
         self._cards_hint.pack(side="left", padx=4)
         self._update_cards_hint()
+        self._apply_cards_btn_visibility()
 
         # Log
         log_frame = tk.Frame(self, bg=BG)
@@ -2648,6 +2734,15 @@ class App(tk.Tk):
                 text="(no cookies set, so drop count is unknown; click this once you see the drops in Steam)"
             )
 
+    def _apply_cards_btn_visibility(self):
+        show = self.config.get("show_cards_manual_btn", False)
+        if show:
+            self._cards_btn.pack(side="left", padx=(0, 6), before=self._cards_hint)
+            self._cards_hint.pack(side="left", padx=4)
+        else:
+            self._cards_btn.pack_forget()
+            self._cards_hint.pack_forget()
+
     def _on_unit_change(self, *_):
         self.config["playtime_unit"] = self._unit
         save_config(self.config)
@@ -2752,7 +2847,33 @@ class App(tk.Tk):
         else:
             self._tree.configure(displaycolumns=tuple(c for c in all_cols if c != "phase1"))
 
-    def _refresh_table(self):
+    def _save_games_debounced(self, delay_ms: int = 2500):
+        """Schedule a save_games call, cancelling any pending one first."""
+        if self._save_after_id is not None:
+            try:
+                self.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+        self._save_after_id = self.after(delay_ms, self._flush_save)
+
+    def _flush_save(self):
+        self._save_after_id = None
+        save_games(self.games)
+
+    def _games_snapshot_hash(self) -> int:
+        """Cheap hash of the game list state for dirty detection."""
+        return hash(tuple(
+            (g["app_id"], g["name"], g["playtime_hours"],
+             g["cards_remaining"], g["phase1_done"],
+             g["cards_done"], g.get("vac_enabled"))
+            for g in self.games
+        ))
+
+    def _refresh_table(self, force: bool = False):
+        new_hash = self._games_snapshot_hash()
+        if not force and new_hash == self._games_hash:
+            return
+        self._games_hash = new_hash
         sel     = self._tree.selection()
         sel_iids = set(sel)
         self._tree.delete(*self._tree.get_children())
@@ -3274,17 +3395,25 @@ class App(tk.Tk):
         self._dispatch(_apply)
 
     def _update_from_thread(self):
-        self._dispatch(self._refresh_table)
+        def _apply():
+            self._refresh_table()
+            self._save_games_debounced()
+        self._dispatch(_apply)
 
     def _status_from_thread(self, st: IdleStatus):
         def _apply():
             self._status_panel.update_status(st, self._running)
+            mode = self.config.get("idle_mode", "multi")
+            # Only pass phase1_remaining_sec when the controller is actually
+            # in a phase1 loop (multi or multi_then_solo). Fast cycle's
+            # next_check_sec is the cycle countdown, not a phase1 time remaining.
+            phase1_sec = st.next_check_sec if (mode in ("multi", "multi_then_solo") and st.phase1_running) else None
             if self._running and st.phase1_running:
                 self._summary.refresh(
                     self.games, self._unit,
                     threshold_h=float(self.config.get("phase1_threshold_seconds", 7200.0) / 3600),
-                    phase1_remaining_sec=st.next_check_sec,
-                    idle_mode=self.config.get("idle_mode", "multi"),
+                    phase1_remaining_sec=phase1_sec,
+                    idle_mode=mode,
                     is_running=True,
                 )
         self._dispatch(_apply)
@@ -3367,6 +3496,7 @@ class App(tk.Tk):
             self.config.update(dlg.result)
             save_config(self.config)
             self._update_cards_hint()
+            self._apply_cards_btn_visibility()
             self._apply_refresh_button_mode()
             # If mode changed away from multi_then_solo, solo-ready is no
             # longer a meaningful concept so normalise all games to True.
@@ -3733,17 +3863,23 @@ class App(tk.Tk):
             for g in unchecked:
                 result = is_vac_enabled(g["app_id"])
                 if result is not None:
-                    g["vac_enabled"] = result
-                self._dispatch(self._refresh_table)
-            save_games(self.games)
-            vac_count = sum(1 for g in self.games if g.get("vac_enabled") is True)
-            if vac_count:
-                self._dispatch(lambda: self._append_log(
-                    f"VAC check done: {vac_count} VAC-enabled game(s) in your list. "
-                    "Pause the idler before playing any VAC-secured game."
-                ))
-            else:
-                self._dispatch(lambda: self._append_log("VAC check done: no VAC-enabled games found."))
+                    def _set(game=g, val=result):
+                        game["vac_enabled"] = val
+                        self._refresh_table()
+                    self._dispatch(_set)
+                else:
+                    self._dispatch(self._refresh_table)
+            def _finish():
+                save_games(self.games)
+                vac_count = sum(1 for g in self.games if g.get("vac_enabled") is True)
+                if vac_count:
+                    self._append_log(
+                        f"VAC check done: {vac_count} VAC-enabled game(s) in your list. "
+                        "Pause the idler before playing any VAC-secured game."
+                    )
+                else:
+                    self._append_log("VAC check done: no VAC-enabled games found.")
+            self._dispatch(_finish)
         threading.Thread(target=_run, daemon=True).start()
 
     def _start_idling(self):
@@ -3778,7 +3914,8 @@ class App(tk.Tk):
         self._running = True
         self._start_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
-        self._cards_btn.config(state="normal")
+        if self.config.get("show_cards_manual_btn", False):
+            self._cards_btn.config(state="normal")
 
         # Refresh drop counts and playtimes first so Phase 1/2 decisions use
         # current data. Silent: if cookies/API key aren't set this just logs
@@ -3831,16 +3968,13 @@ class App(tk.Tk):
         """
         try:
             import pystray
-            from PIL import Image, ImageDraw
+            from PIL import Image
         except ImportError:
             return False
 
-        # Build a simple 64x64 dark icon with an "S" letter.
-        size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        draw.ellipse([2, 2, size - 2, size - 2], fill="#3a7ebf")
-        draw.text((18, 14), "S", fill="#ffffff")
+        img = _make_app_icon(64)
+        if img is None:
+            return False
 
         def _on_restore(icon, item):
             self._tray_restore()
@@ -3892,12 +4026,13 @@ class App(tk.Tk):
 
     def _on_close(self):
         if self.config.get("minimize_to_tray", False):
-            # Try to hide to tray; only prompt/quit if tray setup fails.
+            if self._tray_icon is not None:
+                # Already in tray - just hide again without spawning another icon
+                self.withdraw()
+                return
             if self._try_build_tray():
                 self.withdraw()
                 return
-            # pystray not available: fall through to normal quit behaviour
-            # but warn once so the user knows why.
             self._append_log(
                 "Minimize to tray is enabled but pystray or Pillow is not installed. "
                 "Install them with: pip install pystray pillow"
