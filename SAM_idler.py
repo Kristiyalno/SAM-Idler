@@ -1631,7 +1631,7 @@ class SettingsDialog(tk.Toplevel):
                             "(only needed if you never set session cookies)",
                        variable=self._cards_manual_var,
                        bg=BG, fg=GREY, selectcolor=BTN_BG, activebackground=BG,
-                       font=FONT, justify="left").pack(anchor="w")
+                       font=FONT, justify="left").pack(anchor="w", pady=(0, 4))
 
         # ── Bottom bar: Save / Cancel ────────────────────────────────────────
         sep = tk.Frame(self, bg=GREY, height=1)
@@ -2480,14 +2480,14 @@ class App(tk.Tk):
         self._tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="extended")
         self._style_tree()
 
-        self._tree.heading("order",    text="#",         command=lambda: self._sort_by("order"))
-        self._tree.heading("app_id",   text="App ID",    command=lambda: self._sort_by("app_id"))
-        self._tree.heading("name",     text="Name",      command=lambda: self._sort_by("name"))
-        self._tree.heading("playtime", text="Playtime",  command=lambda: self._sort_by("playtime"))
-        self._tree.heading("drops",    text="Drops left",command=lambda: self._sort_by("drops"))
+        self._tree.heading("order",    text="#",          command=lambda: self._sort_by("order"))
+        self._tree.heading("app_id",   text="App ID",     command=lambda: self._sort_by("app_id"))
+        self._tree.heading("name",     text="Name",       command=lambda: self._sort_by("name"))
+        self._tree.heading("playtime", text="Playtime",   command=lambda: self._sort_by("playtime"))
+        self._tree.heading("drops",    text="Drops left", command=lambda: self._sort_by("drops"))
         self._tree.heading("phase1",   text="Solo ready", command=lambda: self._sort_by("phase1"))
-        self._tree.heading("cards",    text="Cards done",command=lambda: self._sort_by("cards"))
-        self._tree.heading("vac",      text="VAC",       command=lambda: self._sort_by("vac"))
+        self._tree.heading("cards",    text="Cards done", command=lambda: self._sort_by("cards"))
+        self._tree.heading("vac",      text="VAC",        command=lambda: self._sort_by("vac"))
 
         self._tree.column("order",    width=38,  anchor="center", stretch=False)
         self._tree.column("app_id",   width=82,  anchor="center", stretch=False)
@@ -2834,17 +2834,15 @@ class App(tk.Tk):
             self._tree.heading(col, text=text)
 
     def _update_column_visibility(self):
-        """Solo ready only means anything in multi_then_solo mode (it's the
-        multi-idle -> solo handoff flag). In every other mode it's not a
-        real state the user set, just whatever it happened to default to,
-        so showing it as a column invites reading meaning into a value that
-        has none. Hide it outside multi_then_solo, matching the summary bar
-        which already hides its solo-ready stats the same way."""
         all_cols = ("order", "app_id", "name", "playtime", "drops", "phase1", "cards", "vac")
         if self.config.get("idle_mode", "multi") == "multi_then_solo":
-            self._tree.configure(displaycolumns=all_cols)
+            new_cols = all_cols
         else:
-            self._tree.configure(displaycolumns=tuple(c for c in all_cols if c != "phase1"))
+            new_cols = tuple(c for c in all_cols if c != "phase1")
+        current = self._tree.cget("displaycolumns")
+        # Avoid resetting column widths/order if nothing actually changed.
+        if tuple(current) != tuple(new_cols):
+            self._tree.configure(displaycolumns=new_cols)
 
     def _save_games_debounced(self, delay_ms: int = 2500):
         """Schedule a save_games call, cancelling any pending one first."""
@@ -2878,7 +2876,8 @@ class App(tk.Tk):
         if not force and new_hash == self._games_hash:
             return
         self._games_hash = new_hash
-        sel     = self._tree.selection()
+
+        sel      = self._tree.selection()
         sel_iids = set(sel)
         self._tree.delete(*self._tree.get_children())
 
@@ -3258,7 +3257,10 @@ class App(tk.Tk):
         self._refresh_table()
 
     def _drag_start(self, event):
-        # Don't start a drag on a double-click
+        # Ignore clicks on the heading row - those are sort clicks or
+        # column-resize drags, not row reorder drags.
+        if self._tree.identify_region(event.x, event.y) == "heading":
+            return
         item = self._tree.identify_row(event.y)
         if item:
             self._drag_item   = item
